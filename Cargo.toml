@@ -1,0 +1,25 @@
+[workspace]
+members = [".", "rich_canvas"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+eframe = "0.33"
+egui = "0.33"
+image = "0.25"
+
+[package]
+name = "LibeRustOffice_Slides"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+flate2 = "1.1.9"
+image.workspace = true
+quick-xml = "0.39.2"
+rich_canvas = { path = "rich_canvas" }

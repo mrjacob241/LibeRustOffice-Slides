@@ -1,0 +1,8 @@
+[package]
+name = "rich_canvas"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+egui.workspace = true
+image.workspace = true

@@ -16,19 +16,30 @@ const EDITOR_REGULAR_FONT_NAME: &str = "editor_regular";
 const PT_TO_PX: f32 = 4.0 / 3.0;
 const MIN_FONT_SIZE_PT: f32 = 6.0;
 const MAX_FONT_SIZE_PT: f32 = 144.0;
-const TEXT_COLOR_PALETTE: [egui::Color32; 5] = [
+const RECENT_COLOR_SLOT_COUNT: usize = 10;
+const TEXT_COLOR_PALETTE: [egui::Color32; 10] = [
     egui::Color32::BLACK,
     egui::Color32::RED,
     egui::Color32::BLUE,
     egui::Color32::GREEN,
     egui::Color32::from_rgb(255, 165, 0),
+    egui::Color32::WHITE,
+    egui::Color32::from_rgb(128, 0, 128),
+    egui::Color32::from_rgb(0, 150, 160),
+    egui::Color32::from_rgb(120, 80, 40),
+    egui::Color32::from_rgb(90, 90, 90),
 ];
-const HIGHLIGHT_COLOR_PALETTE: [Option<egui::Color32>; 5] = [
+const HIGHLIGHT_COLOR_PALETTE: [Option<egui::Color32>; 10] = [
     None,
     Some(egui::Color32::YELLOW),
     Some(egui::Color32::from_rgb(255, 210, 120)),
     Some(egui::Color32::from_rgb(180, 230, 180)),
     Some(egui::Color32::from_rgb(190, 220, 255)),
+    Some(egui::Color32::from_rgb(255, 180, 180)),
+    Some(egui::Color32::from_rgb(220, 190, 255)),
+    Some(egui::Color32::from_rgb(185, 245, 245)),
+    Some(egui::Color32::from_rgb(235, 235, 160)),
+    Some(egui::Color32::from_rgb(210, 210, 210)),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,6 +73,10 @@ struct LibeRustOfficeSlidesApp {
     link_image_dimensions: bool,
     image_resize_drag: Option<ImageResizeDrag>,
     text_box_drag: Option<TextBoxDrag>,
+    text_rgb_picker: [u8; 3],
+    highlight_rgb_picker: [u8; 3],
+    recent_text_custom_colors: [Option<egui::Color32>; RECENT_COLOR_SLOT_COUNT],
+    recent_highlight_custom_colors: [Option<egui::Color32>; RECENT_COLOR_SLOT_COUNT],
     fit_zoom_pending: bool,
     status: String,
     next_box_id: u64,
@@ -129,6 +144,10 @@ impl LibeRustOfficeSlidesApp {
             link_image_dimensions: true,
             image_resize_drag: None,
             text_box_drag: None,
+            text_rgb_picker: [36, 38, 41],
+            highlight_rgb_picker: [255, 242, 0],
+            recent_text_custom_colors: [None; RECENT_COLOR_SLOT_COUNT],
+            recent_highlight_custom_colors: [None; RECENT_COLOR_SLOT_COUNT],
             fit_zoom_pending: true,
             status,
             next_box_id,
@@ -475,23 +494,33 @@ impl LibeRustOfficeSlidesApp {
             ui.menu_button("   ", |ui| {
                 ui.horizontal(|ui| {
                     for color in TEXT_COLOR_PALETTE {
-                        let (rect, response) =
-                            ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-                        ui.painter().rect_filled(rect.shrink(2.0), 4.0, color);
-                        ui.painter().rect_stroke(
-                            rect.shrink(2.0),
-                            4.0,
-                            egui::Stroke::new(
-                                if color == active_color { 2.0 } else { 1.0 },
-                                egui::Color32::from_gray(90),
-                            ),
-                            egui::StrokeKind::Inside,
-                        );
+                        let response = color_swatch(ui, Some(color), color == active_color);
 
                         if response.clicked() {
                             self.set_selected_text_color(color);
                             ui.close();
                         }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for color in self.recent_text_custom_colors {
+                        let custom_selected = color == Some(active_color);
+                        let response = recent_color_swatch(ui, color, custom_selected);
+                        if response.clicked() {
+                            let Some(color) = color else {
+                                continue;
+                            };
+                            self.set_selected_text_color(color);
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if let Some(color) = rgb_picker_menu(ui, &mut self.text_rgb_picker) {
+                        push_recent_color(&mut self.recent_text_custom_colors, color);
+                        self.set_selected_text_color(color);
+                        ui.close();
                     }
                 });
             });
@@ -521,36 +550,33 @@ impl LibeRustOfficeSlidesApp {
             ui.menu_button("HL", |ui| {
                 ui.horizontal(|ui| {
                     for color in HIGHLIGHT_COLOR_PALETTE {
-                        let (rect, response) =
-                            ui.allocate_exact_size(egui::vec2(24.0, 22.0), egui::Sense::click());
-                        let swatch_rect = rect.shrink(2.0);
-                        if let Some(color) = color {
-                            ui.painter().rect_filled(swatch_rect, 4.0, color);
-                        } else {
-                            ui.painter().rect_filled(
-                                swatch_rect,
-                                4.0,
-                                egui::Color32::from_gray(245),
-                            );
-                            ui.painter().line_segment(
-                                [swatch_rect.left_bottom(), swatch_rect.right_top()],
-                                egui::Stroke::new(1.5, egui::Color32::RED),
-                            );
-                        }
-                        ui.painter().rect_stroke(
-                            swatch_rect,
-                            4.0,
-                            egui::Stroke::new(
-                                if color == active_color { 2.0 } else { 1.0 },
-                                egui::Color32::from_gray(90),
-                            ),
-                            egui::StrokeKind::Inside,
-                        );
+                        let response = color_swatch(ui, color, color == active_color);
 
                         if response.clicked() {
                             self.set_selected_highlight_color(color);
                             ui.close();
                         }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for color in self.recent_highlight_custom_colors {
+                        let custom_selected = color == active_color;
+                        let response = recent_color_swatch(ui, color, custom_selected);
+                        if response.clicked() {
+                            let Some(color) = color else {
+                                continue;
+                            };
+                            self.set_selected_highlight_color(Some(color));
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if let Some(color) = rgb_picker_menu(ui, &mut self.highlight_rgb_picker) {
+                        push_recent_color(&mut self.recent_highlight_custom_colors, color);
+                        self.set_selected_highlight_color(Some(color));
+                        ui.close();
                     }
                 });
             });
@@ -1815,6 +1841,131 @@ fn format_font_size_step_button(label: &str) -> egui::Button<'_> {
     egui::Button::new(egui::RichText::new(label).size(16.0).strong())
         .frame(true)
         .min_size(egui::vec2(28.0, 30.0))
+}
+
+fn color_swatch(ui: &mut egui::Ui, color: Option<egui::Color32>, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 22.0), egui::Sense::click());
+    let swatch_rect = rect.shrink(2.0);
+
+    if let Some(color) = color {
+        ui.painter().rect_filled(swatch_rect, 4.0, color);
+    } else {
+        ui.painter()
+            .rect_filled(swatch_rect, 4.0, egui::Color32::from_gray(245));
+        ui.painter().line_segment(
+            [swatch_rect.left_bottom(), swatch_rect.right_top()],
+            egui::Stroke::new(1.5, egui::Color32::RED),
+        );
+    }
+
+    ui.painter().rect_stroke(
+        swatch_rect,
+        4.0,
+        egui::Stroke::new(
+            if selected { 2.0 } else { 1.0 },
+            egui::Color32::from_gray(90),
+        ),
+        egui::StrokeKind::Inside,
+    );
+
+    response
+}
+
+fn recent_color_swatch(
+    ui: &mut egui::Ui,
+    color: Option<egui::Color32>,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 22.0), egui::Sense::click());
+    let swatch_rect = rect.shrink(2.0);
+    ui.painter().rect_filled(
+        swatch_rect,
+        4.0,
+        color.unwrap_or(egui::Color32::from_gray(45)),
+    );
+    ui.painter().rect_stroke(
+        swatch_rect,
+        4.0,
+        egui::Stroke::new(
+            if selected { 2.0 } else { 1.0 },
+            egui::Color32::from_gray(90),
+        ),
+        egui::StrokeKind::Inside,
+    );
+
+    response
+}
+
+fn push_recent_color(
+    colors: &mut [Option<egui::Color32>; RECENT_COLOR_SLOT_COUNT],
+    color: egui::Color32,
+) {
+    if let Some(index) = colors.iter().position(|recent| *recent == Some(color)) {
+        colors[..=index].rotate_right(1);
+        colors[0] = Some(color);
+        return;
+    }
+
+    colors.rotate_right(1);
+    colors[0] = Some(color);
+}
+
+fn rgb_picker_menu(ui: &mut egui::Ui, picker: &mut [u8; 3]) -> Option<egui::Color32> {
+    let mut picked = None;
+
+    ui.menu_button("RGB", |ui| {
+        ui.set_min_width(280.0);
+        let color = egui::Color32::from_rgb(picker[0], picker[1], picker[2]);
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                rgb_slider(ui, "R", &mut picker[0]);
+                rgb_slider(ui, "G", &mut picker[1]);
+                rgb_slider(ui, "B", &mut picker[2]);
+            });
+
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(72.0, 78.0), egui::Sense::click());
+            let preview_stroke_color = if response.hovered() {
+                egui::Color32::from_rgb(255, 165, 0)
+            } else {
+                egui::Color32::from_gray(90)
+            };
+            ui.painter().rect_filled(rect.shrink(3.0), 4.0, color);
+            ui.painter().rect_stroke(
+                rect.shrink(3.0),
+                4.0,
+                egui::Stroke::new(
+                    if response.hovered() { 2.0 } else { 1.0 },
+                    preview_stroke_color,
+                ),
+                egui::StrokeKind::Inside,
+            );
+            if response.clicked() {
+                picked = Some(color);
+                ui.close();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            let _ = color_swatch(ui, Some(color), false);
+            ui.label(format!("R {}  G {}  B {}", picker[0], picker[1], picker[2]));
+            if ui.button("Apply").clicked() {
+                picked = Some(color);
+                ui.close();
+            }
+        });
+    });
+
+    picked
+}
+
+fn rgb_slider(ui: &mut egui::Ui, label: &str, value: &mut u8) {
+    ui.add(
+        egui::Slider::new(value, 0..=255)
+            .text(label)
+            .show_value(true),
+    );
 }
 
 fn format_text_button(ui: &mut egui::Ui, label: &str, active: bool, tooltip: &str) -> bool {

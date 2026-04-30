@@ -1,10 +1,11 @@
 use eframe::{App, Frame, NativeOptions, egui};
 mod odp_loader;
+mod odp_saver;
 use rich_canvas::{
     AnimationSpec, CanvasMode, CanvasSelection, ImageResizeHandle, LayoutRole, RenderBox,
     RichCanvas, TableBlock, TextAlignment, TextRange, TextRun, TextStyle, TextStyleState,
 };
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 const APP_TITLE: &str = "LibeRustOffice Slides v0.01";
 const SIDE_PANEL_MIN_WIDTH: f32 = 180.0;
@@ -16,6 +17,8 @@ const EDITOR_REGULAR_FONT_NAME: &str = "editor_regular";
 const PT_TO_PX: f32 = 4.0 / 3.0;
 const MIN_FONT_SIZE_PT: f32 = 6.0;
 const MAX_FONT_SIZE_PT: f32 = 144.0;
+const DEFAULT_SAVE_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/sample_docs/saved_slides.odp");
 const RECENT_COLOR_SLOT_COUNT: usize = 10;
 const TEXT_COLOR_PALETTE: [egui::Color32; 10] = [
     egui::Color32::BLACK,
@@ -165,6 +168,29 @@ impl LibeRustOfficeSlidesApp {
                 odp_loader::DEFAULT_ODP_PATH
             )
         });
+        self.apply_loaded_odp(loaded);
+        self.status = format!("Reloaded default ODP {}", odp_loader::DEFAULT_ODP_PATH);
+    }
+
+    fn open_odp(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("OpenDocument Presentation", &["odp"])
+            .pick_file()
+        {
+            match odp_loader::load_odp(&path) {
+                Ok(loaded) => {
+                    self.apply_loaded_odp(loaded);
+                    self.document_name = document_name_from_path(&path);
+                    self.status = format!("Opened ODP {}", path.display());
+                }
+                Err(error) => {
+                    self.status = format!("Open failed: {error}");
+                }
+            }
+        }
+    }
+
+    fn apply_loaded_odp(&mut self, loaded: odp_loader::LoadedOdp) {
         self.slides = loaded.slides;
         self.active_slide = 0;
         self.canvas = self
@@ -181,7 +207,6 @@ impl LibeRustOfficeSlidesApp {
         self.text_box_drag = None;
         self.fit_zoom_pending = true;
         self.document_name = loaded.document_name;
-        self.status = format!("Reloaded default ODP {}", odp_loader::DEFAULT_ODP_PATH);
         self.next_box_id = self
             .slides
             .iter()
@@ -189,6 +214,33 @@ impl LibeRustOfficeSlidesApp {
             .max()
             .unwrap_or(0)
             + 1;
+    }
+
+    fn save_default_odp(&mut self) {
+        self.save_odp_to_path(Path::new(DEFAULT_SAVE_PATH));
+    }
+
+    fn save_odp_as(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("OpenDocument Presentation", &["odp"])
+            .set_file_name(self.document_name.clone())
+            .save_file()
+        {
+            self.save_odp_to_path(&path);
+        }
+    }
+
+    fn save_odp_to_path(&mut self, path: &Path) {
+        self.sync_active_slide();
+        match odp_saver::save_odp(path, &self.slides) {
+            Ok(()) => {
+                self.document_name = document_name_from_path(path);
+                self.status = format!("Saved ODP {}", path.display());
+            }
+            Err(error) => {
+                self.status = format!("Save failed: {error}");
+            }
+        }
     }
 
     fn sync_active_slide(&mut self) {
@@ -255,9 +307,18 @@ impl LibeRustOfficeSlidesApp {
                 ui.close();
             }
 
-            ui.add_enabled(false, egui::Button::new("Open"));
-            ui.add_enabled(false, egui::Button::new("Save"));
-            ui.add_enabled(false, egui::Button::new("Save as..."));
+            if ui.button("Open").clicked() {
+                self.open_odp();
+                ui.close();
+            }
+            if ui.button("Save").on_hover_text(DEFAULT_SAVE_PATH).clicked() {
+                self.save_default_odp();
+                ui.close();
+            }
+            if ui.button("Save as...").clicked() {
+                self.save_odp_as();
+                ui.close();
+            }
         });
     }
 
@@ -1147,6 +1208,7 @@ impl LibeRustOfficeSlidesApp {
 
         render_box.position = position;
         render_box.size = size;
+        render_box.authored_size = Some(size);
         self.canvas.relayout(CanvasMode::SlideDeck);
         self.status = format!("Text box resized to {:.0} x {:.0}", size.x, size.y);
     }
@@ -1981,6 +2043,14 @@ fn format_text_button(ui: &mut egui::Ui, label: &str, active: bool, tooltip: &st
     }
 
     ui.add(button).on_hover_text(tooltip).clicked()
+}
+
+fn document_name_from_path(path: impl AsRef<Path>) -> String {
+    path.as_ref()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Untitled.odp")
+        .to_owned()
 }
 
 fn configure_local_editor_fonts(ctx: &egui::Context) {

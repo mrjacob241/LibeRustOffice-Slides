@@ -8,7 +8,8 @@
 ## 🚧 Planned Features 🚧 
 
 - [x] Open and read 'odp' presentation files  
-- [ ] Create and save new 'odp' files  
+- [x] First minimal save/save-as for 'odp' files, preserving supported text and image frames  
+- [ ] Print to File (PDF)
 - [x] Basic slide rendering  
 - [x] Add and edit text elements  
 - [ ] Insert and resize images  
@@ -31,6 +32,7 @@
 - [ ] Cloud sync integration  
 - [ ] Full compatibility with LibreOffice   
 - [ ] Presenter mode  
+- [ ] Native printing (Linux)
 - [ ] Spell checking and grammar suggestions  
 
 Stay Tuned!

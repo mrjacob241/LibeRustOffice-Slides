@@ -1088,6 +1088,7 @@ impl FrameImport {
             render_box.kind = RenderBoxKind::Image(image);
             render_box.position = self.position;
             render_box.size = self.size.max(Vec2::splat(24.0));
+            render_box.authored_size = Some(render_box.size);
             render_box.style.fill = Color32::from_rgb(246, 248, 250);
             return Ok(Some(render_box));
         }
@@ -1099,6 +1100,7 @@ impl FrameImport {
         let mut render_box = RenderBox::text(id, LayoutRole::Absolute, self.runs);
         render_box.position = self.position;
         render_box.size = self.size.max(vec2(80.0, 40.0));
+        render_box.authored_size = Some(render_box.size);
         if let Some(alignment) = self.alignment {
             render_box.set_text_alignment(alignment);
         }

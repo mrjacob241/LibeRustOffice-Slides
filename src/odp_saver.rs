@@ -69,7 +69,7 @@ impl OdpPackage {
     fn from_slides(slides: &[RichCanvas]) -> Result<Self, OdpSaveError> {
         let slide_size = slides
             .first()
-            .map(|slide| slide.size)
+            .map(|slide| slide.page.size)
             .unwrap_or(Vec2::new(1280.0, 720.0));
         let mut builder = ContentBuilder::new(slide_size);
         let content_xml = builder.content_xml(slides)?;
@@ -652,6 +652,22 @@ mod tests {
             text_scheme(&saved_loaded.slides),
             text_scheme(&loaded.slides)
         );
+    }
+
+    #[test]
+    fn saving_loaded_default_odp_preserves_slide_page_size() {
+        let loaded = odp_loader::load_default_odp().expect("default ODP loads");
+        let saved_path = std::env::temp_dir().join("test_slides_page_size_regression.odp");
+
+        save_odp(&saved_path, &loaded.slides).expect("save succeeds");
+
+        let styles_xml =
+            stored_zip_entry_text(&saved_path, "styles.xml").expect("saved styles.xml exists");
+
+        assert!(styles_xml.contains(r#"fo:page-width="28.0000cm""#));
+        assert!(styles_xml.contains(r#"fo:page-height="15.7500cm""#));
+        assert!(!styles_xml.contains(r#"fo:page-width="30.6250cm""#));
+        assert!(!styles_xml.contains(r#"fo:page-height="18.3750cm""#));
     }
 
     #[test]

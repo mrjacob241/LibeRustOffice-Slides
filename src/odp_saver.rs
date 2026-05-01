@@ -7,8 +7,8 @@ use std::{
 use egui::{Color32, Vec2};
 use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
 use rich_canvas::{
-    BoxStyle, RenderBox, RenderBoxKind, RichCanvas, TextAlignment, TextRun, TextStyle,
-    TextVerticalAlignment,
+    BoxStrokeKind, BoxStyle, RenderBox, RenderBoxKind, RichCanvas, TextAlignment, TextRun,
+    TextStyle, TextVerticalAlignment,
 };
 
 const ODP_MIME_TYPE: &str = "application/vnd.oasis.opendocument.presentation";
@@ -323,6 +323,7 @@ impl ContentBuilder {
             fill: style.fill,
             stroke: style.stroke,
             stroke_width_millipx: millipx(style.stroke_width),
+            stroke_kind: style.stroke_kind,
             vertical_alignment,
         });
         name
@@ -407,6 +408,7 @@ struct SavedGraphicStyle {
     fill: Color32,
     stroke: Color32,
     stroke_width_millipx: i32,
+    stroke_kind: BoxStrokeKind,
     vertical_alignment: TextVerticalAlignment,
 }
 
@@ -415,6 +417,7 @@ impl SavedGraphicStyle {
         self.fill == style.fill
             && self.stroke == style.stroke
             && self.stroke_width_millipx == millipx(style.stroke_width)
+            && self.stroke_kind == style.stroke_kind
             && self.vertical_alignment == vertical_alignment
     }
 
@@ -431,8 +434,12 @@ impl SavedGraphicStyle {
         {
             r#"draw:stroke="none""#.to_owned()
         } else {
+            let stroke_type = match self.stroke_kind {
+                BoxStrokeKind::Solid => "solid",
+                BoxStrokeKind::Dash => "dash",
+            };
             format!(
-                r#"draw:stroke="solid" svg:stroke-color="{}" svg:stroke-width="{}""#,
+                r#"draw:stroke="{stroke_type}" svg:stroke-color="{}" svg:stroke-width="{}""#,
                 color_hex(self.stroke),
                 length_cm(self.stroke_width_millipx as f32 / 1000.0)
             )

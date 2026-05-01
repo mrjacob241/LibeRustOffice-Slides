@@ -1,7 +1,10 @@
 use std::{fmt, fs, io, path::Path};
 
-use egui::Color32;
-use rich_canvas::{RenderBox, RenderBoxKind, RichCanvas, TextAlignment, TextRun};
+use egui::{Color32, Pos2};
+use rich_canvas::{
+    BoxStrokeKind, RenderBox, RenderBoxKind, RichCanvas, TextAlignment, TextRun,
+    TextVerticalAlignment,
+};
 
 const PX_PER_CM: f32 = 1280.0 / 28.0;
 const PT_PER_IN: f32 = 72.0;
@@ -170,6 +173,7 @@ impl PdfPageBuild {
                         render_box,
                         &block.runs,
                         block.alignment,
+                        block.vertical_alignment,
                         height_pt,
                     );
                 }
@@ -233,14 +237,11 @@ impl PdfImage {
 }
 
 fn push_image_box(content: &mut Vec<u8>, render_box: &RenderBox, image_name: &str, page_h: f32) {
-    let x = px_to_pt(render_box.position.x);
-    let y = page_h - px_to_pt(render_box.position.y + render_box.size.y * render_box.scale.y);
-    let w = px_to_pt(render_box.size.x * render_box.scale.x);
-    let h = px_to_pt(render_box.size.y * render_box.scale.y);
+    let rect = pdf_rect_from_rendered_vertices(rendered_box_vertices(render_box), page_h);
     content.extend_from_slice(
         format!(
             "q {:.4} 0 0 {:.4} {:.4} {:.4} cm /{} Do Q\n",
-            w, h, x, y, image_name
+            rect.w, rect.h, rect.x, rect.y, image_name
         )
         .as_bytes(),
     );
@@ -251,18 +252,36 @@ fn push_text_box(
     render_box: &RenderBox,
     runs: &[TextRun],
     alignment: TextAlignment,
+    vertical_alignment: TextVerticalAlignment,
     page_h: f32,
 ) {
-    let box_x = px_to_pt(render_box.position.x);
-    let box_y = px_to_pt(render_box.position.y);
-    let box_w = px_to_pt(render_box.size.x * render_box.scale.x);
-    let padding = render_box.style.padding * PT_PER_PX;
-    let max_width = (box_w - padding.x * 2.0).max(12.0);
-    let lines = wrap_runs(runs, max_width / PT_PER_PX);
-    let mut y = page_h - box_y - padding.y;
+    let vertices = rendered_box_vertices(render_box);
+    let frame_rect = pdf_rect_from_rendered_vertices(vertices, page_h);
+    push_text_box_frame(content, render_box, frame_rect);
 
-    for line in lines {
-        let line = merge_adjacent_segments(line);
+    let padding = render_box.style.padding * PT_PER_PX;
+    let max_width = (frame_rect.w - padding.x * 2.0).max(12.0);
+    let lines = wrap_runs(runs, max_width / PT_PER_PX)
+        .into_iter()
+        .map(merge_adjacent_segments)
+        .collect::<Vec<_>>();
+    let line_metrics = lines
+        .iter()
+        .map(|line| pdf_line_metrics(line))
+        .collect::<Vec<_>>();
+    let text_height = line_metrics
+        .iter()
+        .map(|metrics| metrics.height)
+        .sum::<f32>();
+    let content_height = (frame_rect.h - padding.y * 2.0).max(0.0);
+    let vertical_offset = match vertical_alignment {
+        TextVerticalAlignment::Top => 0.0,
+        TextVerticalAlignment::Center => (content_height - text_height).max(0.0) * 0.5,
+        TextVerticalAlignment::Bottom => (content_height - text_height).max(0.0),
+    };
+    let mut line_top = frame_rect.y + frame_rect.h - padding.y - vertical_offset;
+
+    for (line, metrics) in lines.into_iter().zip(line_metrics) {
         let line_width = line
             .iter()
             .map(|segment| px_to_pt(segment.width_px()))
@@ -272,12 +291,8 @@ fn push_text_box(
             TextAlignment::Right => (max_width - line_width).max(0.0),
             TextAlignment::Left | TextAlignment::Justify => 0.0,
         };
-        let mut x = box_x + padding.x + x_offset;
-        let line_height = line
-            .iter()
-            .map(|segment| px_to_pt(segment.style.font_size) * 1.2)
-            .fold(12.0_f32, f32::max);
-        y -= line_height;
+        let mut x = frame_rect.x + padding.x + x_offset;
+        let y = line_top - metrics.baseline_offset;
 
         for segment in line {
             if segment.text.is_empty() {
@@ -326,7 +341,93 @@ fn push_text_box(
             }
             x += px_to_pt(segment.width_px());
         }
+        line_top -= metrics.height;
     }
+}
+
+#[derive(Clone, Copy)]
+struct PdfLineMetrics {
+    height: f32,
+    baseline_offset: f32,
+}
+
+fn pdf_line_metrics(line: &[TextSegment]) -> PdfLineMetrics {
+    let max_font_size = line
+        .iter()
+        .map(|segment| px_to_pt(segment.style.font_size))
+        .fold(10.0_f32, f32::max);
+    PdfLineMetrics {
+        height: (max_font_size * 1.2).max(12.0),
+        baseline_offset: max_font_size,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PdfRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+fn rendered_box_vertices(render_box: &RenderBox) -> [Pos2; 4] {
+    let rect = render_box.rect(Pos2::ZERO, 1.0);
+    [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ]
+}
+
+fn pdf_rect_from_rendered_vertices(vertices: [Pos2; 4], page_h: f32) -> PdfRect {
+    let min_x = vertices
+        .iter()
+        .map(|vertex| vertex.x)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = vertices
+        .iter()
+        .map(|vertex| vertex.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = vertices
+        .iter()
+        .map(|vertex| vertex.y)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = vertices
+        .iter()
+        .map(|vertex| vertex.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let x = px_to_pt(min_x);
+    let y = page_h - px_to_pt(max_y);
+    let w = px_to_pt(max_x - min_x);
+    let h = px_to_pt(max_y - min_y);
+    PdfRect { x, y, w, h }
+}
+
+fn push_text_box_frame(content: &mut Vec<u8>, render_box: &RenderBox, rect: PdfRect) {
+    if render_box.style.fill != Color32::TRANSPARENT {
+        push_rect_fill(
+            content,
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            render_box.style.fill,
+        );
+    }
+
+    if render_box.style.stroke == Color32::TRANSPARENT || render_box.style.stroke_width <= 0.0 {
+        return;
+    }
+
+    push_rect_stroke(
+        content,
+        rect,
+        render_box.style.stroke,
+        px_to_pt(render_box.style.stroke_width),
+        render_box.style.stroke_kind,
+    );
 }
 
 fn wrap_runs(runs: &[TextRun], max_width_px: f32) -> Vec<Vec<TextSegment>> {
@@ -436,6 +537,48 @@ fn push_rect_fill(content: &mut Vec<u8>, x: f32, y: f32, w: f32, h: f32, color: 
             y,
             w,
             h
+        )
+        .as_bytes(),
+    );
+}
+
+fn push_rect_stroke(
+    content: &mut Vec<u8>,
+    rect: PdfRect,
+    color: Color32,
+    stroke_width: f32,
+    stroke_kind: BoxStrokeKind,
+) {
+    let inset = stroke_width * 0.5;
+    let stroke_rect = PdfRect {
+        x: rect.x + inset,
+        y: rect.y + inset,
+        w: (rect.w - stroke_width).max(0.0),
+        h: (rect.h - stroke_width).max(0.0),
+    };
+    let dash = match stroke_kind {
+        BoxStrokeKind::Solid => String::new(),
+        BoxStrokeKind::Dash => format!(
+            "[{:.4} {:.4}] 0 d ",
+            (6.0 * PT_PER_PX).max(stroke_width * 2.0),
+            (4.0 * PT_PER_PX).max(stroke_width)
+        ),
+    };
+    let reset_dash = match stroke_kind {
+        BoxStrokeKind::Solid => "",
+        BoxStrokeKind::Dash => " [] 0 d",
+    };
+    content.extend_from_slice(
+        format!(
+            "{:.4} {:.4} {:.4} RG {:.4} w {dash}{:.4} {:.4} {:.4} {:.4} re S{reset_dash}\n",
+            color_unit(color.r()),
+            color_unit(color.g()),
+            color_unit(color.b()),
+            stroke_width.max(0.1),
+            stroke_rect.x,
+            stroke_rect.y,
+            stroke_rect.w,
+            stroke_rect.h
         )
         .as_bytes(),
     );
@@ -558,7 +701,7 @@ mod tests {
     use super::*;
     use crate::odp_loader;
     use egui::{pos2, vec2};
-    use rich_canvas::{LayoutRole, RenderBox, TextStyle};
+    use rich_canvas::{BoxStrokeKind, LayoutRole, RenderBox, TextStyle, TextVerticalAlignment};
 
     #[test]
     fn exports_pdf_with_one_page_per_slide() {
@@ -632,6 +775,97 @@ mod tests {
     }
 
     #[test]
+    fn text_box_fill_and_border_are_written_to_pdf() {
+        let mut slide = RichCanvas::new(vec2(1280.0, 720.0));
+        let mut text = RenderBox::text(
+            1,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Styled box", TextStyle::body())],
+        );
+        text.position = pos2(80.0, 80.0);
+        text.size = vec2(320.0, 90.0);
+        text.style.fill = Color32::from_rgb(12, 34, 56);
+        text.style.stroke = Color32::from_rgb(200, 120, 30);
+        text.style.stroke_width = 2.5;
+        slide.push(text);
+
+        let bytes = export_pdf_bytes(&[slide]).expect("PDF export should succeed");
+        let pdf = String::from_utf8_lossy(&bytes);
+
+        assert!(pdf.contains("0.0471 0.1333 0.2196 rg"));
+        assert!(pdf.contains("0.7843 0.4706 0.1176 RG"));
+        assert!(pdf.contains("1.5502 w"));
+        assert!(pdf.contains("(Styled box) Tj"));
+    }
+
+    #[test]
+    fn dashed_text_box_border_is_written_to_pdf() {
+        let mut slide = RichCanvas::new(vec2(1280.0, 720.0));
+        let mut text = RenderBox::text(
+            1,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Dashed box", TextStyle::body())],
+        );
+        text.style.stroke = Color32::BLACK;
+        text.style.stroke_kind = BoxStrokeKind::Dash;
+        slide.push(text);
+
+        let bytes = export_pdf_bytes(&[slide]).expect("PDF export should succeed");
+        let pdf = String::from_utf8_lossy(&bytes);
+
+        assert!(pdf.contains("[3.7205 2.4803] 0 d"));
+        assert!(pdf.contains("[] 0 d"));
+        assert!(pdf.contains("(Dashed box) Tj"));
+    }
+
+    #[test]
+    fn pdf_text_box_frame_uses_rendered_canvas_vertices() {
+        let mut text = RenderBox::text(
+            1,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Geometry", TextStyle::body())],
+        );
+        text.position = pos2(80.0, 90.0);
+        text.size = vec2(320.0, 100.0);
+        text.scale = vec2(1.25, 1.5);
+
+        let vertices = rendered_box_vertices(&text);
+        assert_close(vertices[0].x, 80.0);
+        assert_close(vertices[0].y, 90.0);
+        assert_close(vertices[2].x, 480.0);
+        assert_close(vertices[2].y, 240.0);
+
+        let rect = pdf_rect_from_rendered_vertices(vertices, px_to_pt(720.0));
+        assert_close(rect.x, px_to_pt(80.0));
+        assert_close(rect.y, px_to_pt(720.0 - 240.0));
+        assert_close(rect.w, px_to_pt(400.0));
+        assert_close(rect.h, px_to_pt(150.0));
+    }
+
+    #[test]
+    fn pdf_text_uses_text_box_vertical_alignment() {
+        let mut slide = RichCanvas::new(vec2(1280.0, 720.0));
+        let mut text = RenderBox::text(
+            1,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Centered", TextStyle::body())],
+        );
+        text.position = pos2(80.0, 80.0);
+        text.size = vec2(320.0, 240.0);
+        text.style.fill = Color32::TRANSPARENT;
+        text.style.stroke = Color32::TRANSPARENT;
+        if let RenderBoxKind::Text(block) = &mut text.kind {
+            block.vertical_alignment = TextVerticalAlignment::Center;
+        }
+        slide.push(text);
+
+        let bytes = export_pdf_bytes(&[slide]).expect("PDF export should succeed");
+        let pdf = String::from_utf8_lossy(&bytes);
+
+        assert!(pdf.contains("60.7677 317.4803 Td (Centered) Tj"));
+    }
+
+    #[test]
     fn default_odp_can_be_written_as_pdf_file() {
         let loaded = odp_loader::load_default_odp().expect("default ODP loads");
         let path = std::env::temp_dir().join("liberustoffice_default_export.pdf");
@@ -653,5 +887,12 @@ mod tests {
         title.size = vec2(600.0, 100.0);
         slide.push(title);
         slide
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "expected {actual} to be close to {expected}"
+        );
     }
 }

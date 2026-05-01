@@ -3,8 +3,9 @@ mod odp_loader;
 mod odp_saver;
 mod pdf_exporter;
 use rich_canvas::{
-    AnimationSpec, CanvasMode, CanvasSelection, ImageResizeHandle, LayoutRole, RenderBox,
-    RichCanvas, TableBlock, TextAlignment, TextRange, TextRun, TextStyle, TextStyleState,
+    AnimationSpec, BoxStrokeKind, CanvasMode, CanvasSelection, ImageResizeHandle, LayoutRole,
+    RenderBox, RenderBoxKind, RichCanvas, TableBlock, TextAlignment, TextRange, TextRun, TextStyle,
+    TextStyleState, TextVerticalAlignment,
 };
 use std::{path::Path, sync::Arc};
 
@@ -840,7 +841,122 @@ impl LibeRustOfficeSlidesApp {
         changed |= draw_f32_drag_field(ui, "Height", &mut render_box.size.y, 1.0, 4096.0);
         changed |= draw_f32_drag_field(ui, "Rotation", &mut render_box.rotation, -360.0, 360.0);
 
+        ui.separator();
+        ui.heading("Background");
+        let mut transparent_background = render_box.style.fill == egui::Color32::TRANSPARENT;
+        if ui
+            .checkbox(&mut transparent_background, "Transparent")
+            .changed()
+        {
+            render_box.style.fill = if transparent_background {
+                egui::Color32::TRANSPARENT
+            } else {
+                egui::Color32::WHITE
+            };
+            changed = true;
+        }
+        if !transparent_background {
+            ui.horizontal(|ui| {
+                ui.label("Color");
+                changed |= ui
+                    .color_edit_button_srgba(&mut render_box.style.fill)
+                    .changed();
+            });
+        }
+
+        ui.separator();
+        ui.heading("Line");
+        let mut line_enabled = render_box.style.stroke != egui::Color32::TRANSPARENT
+            && render_box.style.stroke_width > 0.0;
+        if ui.checkbox(&mut line_enabled, "Visible").changed() {
+            if line_enabled {
+                render_box.style.stroke = egui::Color32::from_rgb(0x34, 0x65, 0xa4);
+                render_box.style.stroke_width = render_box.style.stroke_width.max(1.0);
+            } else {
+                render_box.style.stroke = egui::Color32::TRANSPARENT;
+            }
+            changed = true;
+        }
+        if line_enabled {
+            ui.horizontal(|ui| {
+                ui.label("Color");
+                changed |= ui
+                    .color_edit_button_srgba(&mut render_box.style.stroke)
+                    .changed();
+            });
+            changed |=
+                draw_f32_drag_field(ui, "Width", &mut render_box.style.stroke_width, 0.1, 64.0);
+            ui.horizontal(|ui| {
+                ui.label("Type");
+                changed |= ui
+                    .selectable_value(
+                        &mut render_box.style.stroke_kind,
+                        BoxStrokeKind::Solid,
+                        "Solid",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut render_box.style.stroke_kind,
+                        BoxStrokeKind::Dash,
+                        "Dash",
+                    )
+                    .changed();
+            });
+        }
+
         if let Some(style_state) = render_box.text_style_state() {
+            ui.separator();
+            ui.heading("Justification & Alignment");
+            let mut horizontal_alignment = style_state.alignment;
+            ui.horizontal(|ui| {
+                ui.label("Horizontal");
+                changed |= ui
+                    .selectable_value(&mut horizontal_alignment, TextAlignment::Left, "Left")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut horizontal_alignment, TextAlignment::Center, "Center")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut horizontal_alignment, TextAlignment::Right, "Right")
+                    .changed();
+                changed |= ui
+                    .selectable_value(&mut horizontal_alignment, TextAlignment::Justify, "Fill")
+                    .changed();
+            });
+            if horizontal_alignment != style_state.alignment {
+                render_box.set_text_alignment(horizontal_alignment);
+            }
+
+            let current_vertical_alignment = match &render_box.kind {
+                RenderBoxKind::Text(block) => block.vertical_alignment,
+                _ => TextVerticalAlignment::Top,
+            };
+            let mut vertical_alignment = current_vertical_alignment;
+            ui.horizontal(|ui| {
+                ui.label("Vertical");
+                changed |= ui
+                    .selectable_value(&mut vertical_alignment, TextVerticalAlignment::Top, "Top")
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut vertical_alignment,
+                        TextVerticalAlignment::Center,
+                        "Middle",
+                    )
+                    .changed();
+                changed |= ui
+                    .selectable_value(
+                        &mut vertical_alignment,
+                        TextVerticalAlignment::Bottom,
+                        "Bottom",
+                    )
+                    .changed();
+            });
+            if vertical_alignment != current_vertical_alignment {
+                render_box.set_text_vertical_alignment(vertical_alignment);
+            }
+
             ui.separator();
             let mut font_size_pt = style_state.font_size / PT_TO_PX;
             if draw_f32_drag_field(

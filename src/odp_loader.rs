@@ -13,8 +13,8 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 use rich_canvas::{
-    CanvasMode, ImageBlock, LayoutRole, RenderBox, RenderBoxKind, RichCanvas, TextAlignment,
-    TextRun, TextStyle, TextVerticalAlignment,
+    BoxStrokeKind, BoxStyle, CanvasMode, ImageBlock, LayoutRole, RenderBox, RenderBoxKind,
+    RichCanvas, TextAlignment, TextRun, TextStyle, TextVerticalAlignment,
 };
 
 const ODP_MIME_TYPE: &str = "application/vnd.oasis.opendocument.presentation";
@@ -132,6 +132,7 @@ impl OdpDocumentParts {
 struct StyleContext {
     page_size: Vec2,
     text_styles: HashMap<String, TextStyleDef>,
+    graphic_styles: HashMap<String, GraphicStyleDef>,
     paragraph_alignments: HashMap<String, TextAlignment>,
     text_vertical_alignments: HashMap<String, TextVerticalAlignment>,
 }
@@ -143,6 +144,10 @@ impl StyleContext {
         Ok(Self {
             page_size: default_page_size(&master_pages, &page_layouts),
             text_styles: parse_text_styles_from_documents(&[
+                &parts.styles_xml,
+                &parts.content_xml,
+            ])?,
+            graphic_styles: parse_graphic_styles_from_documents(&[
                 &parts.styles_xml,
                 &parts.content_xml,
             ])?,
@@ -596,6 +601,192 @@ fn resolve_text_style_def(
     resolved
 }
 
+fn parse_graphic_styles_from_documents(
+    xml_documents: &[&str],
+) -> Result<HashMap<String, GraphicStyleDef>, OdpLoadError> {
+    let mut definitions = HashMap::new();
+    for xml in xml_documents {
+        definitions.extend(parse_graphic_style_defs(xml)?);
+    }
+
+    let mut resolved = HashMap::new();
+    for name in definitions.keys() {
+        resolved.insert(
+            name.clone(),
+            resolve_graphic_style_def(name, &definitions, &mut Vec::new()),
+        );
+    }
+
+    Ok(resolved)
+}
+
+#[derive(Clone, Debug, Default)]
+struct GraphicStyleDef {
+    parent: Option<String>,
+    fill: Option<Option<Color32>>,
+    stroke_enabled: Option<bool>,
+    stroke_color: Option<Color32>,
+    stroke_width: Option<f32>,
+    stroke_kind: Option<BoxStrokeKind>,
+}
+
+impl GraphicStyleDef {
+    fn apply_def(&mut self, other: &Self) {
+        if other.fill.is_some() {
+            self.fill = other.fill;
+        }
+        if other.stroke_enabled.is_some() {
+            self.stroke_enabled = other.stroke_enabled;
+        }
+        if other.stroke_color.is_some() {
+            self.stroke_color = other.stroke_color;
+        }
+        if other.stroke_width.is_some() {
+            self.stroke_width = other.stroke_width;
+        }
+        if other.stroke_kind.is_some() {
+            self.stroke_kind = other.stroke_kind;
+        }
+    }
+
+    fn apply_to_style(&self, style: &mut BoxStyle) {
+        if let Some(fill) = self.fill {
+            style.fill = fill.unwrap_or(Color32::TRANSPARENT);
+        }
+        if let Some(enabled) = self.stroke_enabled {
+            if enabled {
+                if style.stroke == Color32::TRANSPARENT {
+                    style.stroke = default_odp_stroke_color();
+                }
+            } else {
+                style.stroke = Color32::TRANSPARENT;
+            }
+        }
+        if self.stroke_enabled != Some(false) {
+            if let Some(stroke_color) = self.stroke_color {
+                style.stroke = stroke_color;
+            }
+        }
+        if let Some(stroke_width) = self.stroke_width {
+            style.stroke_width = stroke_width;
+        }
+        if let Some(stroke_kind) = self.stroke_kind {
+            style.stroke_kind = stroke_kind;
+        }
+    }
+}
+
+fn parse_graphic_style_defs(xml: &str) -> Result<HashMap<String, GraphicStyleDef>, OdpLoadError> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut definitions = HashMap::new();
+    let mut active_style = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) if local_name(event.name().as_ref()) == b"style" => {
+                active_style = attr(&event, reader.decoder(), b"name").map(|name| {
+                    (
+                        name,
+                        GraphicStyleDef {
+                            parent: attr(&event, reader.decoder(), b"parent-style-name"),
+                            ..Default::default()
+                        },
+                    )
+                });
+            }
+            Ok(Event::Empty(event)) if local_name(event.name().as_ref()) == b"style" => {
+                if let Some(name) = attr(&event, reader.decoder(), b"name") {
+                    definitions.insert(
+                        name,
+                        GraphicStyleDef {
+                            parent: attr(&event, reader.decoder(), b"parent-style-name"),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            Ok(Event::Empty(event)) | Ok(Event::Start(event))
+                if local_name(event.name().as_ref()) == b"graphic-properties" =>
+            {
+                if let Some((_name, definition)) = active_style.as_mut() {
+                    if let Some(fill) = attr(&event, reader.decoder(), b"fill") {
+                        if fill == "none" {
+                            definition.fill = Some(None);
+                        }
+                    }
+                    if let Some(fill_color) =
+                        attr(&event, reader.decoder(), b"fill-color").and_then(|v| parse_color(&v))
+                    {
+                        definition.fill = Some(Some(fill_color));
+                    }
+                    if let Some(stroke) = attr(&event, reader.decoder(), b"stroke") {
+                        match stroke.as_str() {
+                            "none" => definition.stroke_enabled = Some(false),
+                            "solid" => {
+                                definition.stroke_enabled = Some(true);
+                                definition.stroke_kind = Some(BoxStrokeKind::Solid);
+                            }
+                            "dash" => {
+                                definition.stroke_enabled = Some(true);
+                                definition.stroke_kind = Some(BoxStrokeKind::Dash);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(stroke_color) = attr(&event, reader.decoder(), b"stroke-color")
+                        .and_then(|v| parse_color(&v))
+                    {
+                        definition.stroke_color = Some(stroke_color);
+                    }
+                    if let Some(stroke_width) = attr(&event, reader.decoder(), b"stroke-width")
+                        .and_then(|v| parse_length(&v))
+                    {
+                        definition.stroke_width = Some(stroke_width);
+                    }
+                }
+            }
+            Ok(Event::End(event)) if local_name(event.name().as_ref()) == b"style" => {
+                if let Some((name, definition)) = active_style.take() {
+                    definitions.insert(name, definition);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(OdpLoadError::Xml(error.to_string())),
+            _ => {}
+        }
+    }
+
+    Ok(definitions)
+}
+
+fn default_odp_stroke_color() -> Color32 {
+    Color32::from_rgb(0x34, 0x65, 0xa4)
+}
+
+fn resolve_graphic_style_def(
+    name: &str,
+    definitions: &HashMap<String, GraphicStyleDef>,
+    seen: &mut Vec<String>,
+) -> GraphicStyleDef {
+    if seen.iter().any(|seen_name| seen_name == name) {
+        return GraphicStyleDef::default();
+    }
+    seen.push(name.to_owned());
+
+    let Some(definition) = definitions.get(name) else {
+        return GraphicStyleDef::default();
+    };
+    let mut resolved = definition
+        .parent
+        .as_deref()
+        .map(|parent| resolve_graphic_style_def(parent, definitions, seen))
+        .unwrap_or_default();
+    resolved.apply_def(definition);
+    resolved.parent = None;
+    resolved
+}
+
 #[cfg(test)]
 fn text_style_defs_to_styles(defs: HashMap<String, TextStyleDef>) -> HashMap<String, TextStyle> {
     defs.into_iter()
@@ -879,6 +1070,10 @@ impl<'a> SlideImporter<'a> {
                                 Some(style_name.as_str()),
                                 &self.styles.text_styles,
                             );
+                            import.apply_graphic_style(
+                                Some(style_name.as_str()),
+                                &self.styles.graphic_styles,
+                            );
                             import.apply_vertical_alignment_style(
                                 Some(style_name.as_str()),
                                 &self.styles.text_vertical_alignments,
@@ -987,6 +1182,7 @@ struct FrameImport {
     alignment: Option<TextAlignment>,
     vertical_alignment: Option<TextVerticalAlignment>,
     text_style: Option<TextStyle>,
+    box_style: Option<BoxStyle>,
     runs: Vec<TextRun>,
     image_href: Option<String>,
 }
@@ -1014,6 +1210,7 @@ impl FrameImport {
             alignment: None,
             vertical_alignment: None,
             text_style: None,
+            box_style: None,
             runs: Vec::new(),
             image_href: None,
         }
@@ -1036,6 +1233,23 @@ impl FrameImport {
     ) {
         if let Some(definition) = style_name.and_then(|name| text_styles.get(name)) {
             let style = self.text_style.get_or_insert_with(TextStyle::body);
+            definition.apply_to_style(style);
+        }
+    }
+
+    fn apply_graphic_style(
+        &mut self,
+        style_name: Option<&str>,
+        graphic_styles: &HashMap<String, GraphicStyleDef>,
+    ) {
+        if let Some(definition) = style_name.and_then(|name| graphic_styles.get(name)) {
+            let style = self.box_style.get_or_insert_with(|| {
+                let mut style = BoxStyle::default();
+                style.fill = Color32::TRANSPARENT;
+                style.stroke = Color32::TRANSPARENT;
+                style.corner_radius = 0.0;
+                style
+            });
             definition.apply_to_style(style);
         }
     }
@@ -1106,6 +1320,9 @@ impl FrameImport {
         render_box.position = self.position;
         render_box.size = self.size.max(vec2(80.0, 40.0));
         render_box.authored_size = Some(render_box.size);
+        if let Some(style) = self.box_style {
+            render_box.style = style;
+        }
         if let Some(alignment) = self.alignment {
             render_box.set_text_alignment(alignment);
         }
@@ -1270,6 +1487,14 @@ mod tests {
             RenderBoxKind::Text(block)
                 if block.plain_text() == "Test Slides" && block.alignment == TextAlignment::Center
         )));
+        let title_box = loaded.slides[0]
+            .boxes
+            .iter()
+            .find(|render_box| render_box.plain_text().as_deref() == Some("Test Slides"))
+            .expect("first slide title should load");
+        assert_eq!(title_box.style.fill, Color32::from_rgb(0x81, 0xd4, 0x1a));
+        assert_ne!(title_box.style.stroke, Color32::TRANSPARENT);
+        assert_eq!(title_box.style.corner_radius, 0.0);
         let subtitle_style = loaded.slides[0].boxes.iter().find_map(|render_box| {
             let RenderBoxKind::Text(block) = &render_box.kind else {
                 return None;
@@ -1460,6 +1685,7 @@ mod tests {
         let styles = StyleContext {
             page_size: DEFAULT_SLIDE_SIZE,
             text_styles: HashMap::new(),
+            graphic_styles: HashMap::new(),
             paragraph_alignments: HashMap::new(),
             text_vertical_alignments: HashMap::new(),
         };
@@ -1510,6 +1736,131 @@ mod tests {
     }
 
     #[test]
+    fn loads_text_box_fill_and_line_color_from_frame_style() {
+        let content_xml = r##"
+            <office:document-content>
+                <office:automatic-styles>
+                    <style:style style:name="BoxGraphic" style:family="graphic">
+                        <style:graphic-properties draw:fill="solid" draw:fill-color="#0c2238"
+                            draw:stroke="solid" svg:stroke-color="#c8781e"
+                            svg:stroke-width="0.0547cm"/>
+                    </style:style>
+                </office:automatic-styles>
+                <office:body>
+                    <office:presentation>
+                        <draw:page draw:name="page1">
+                            <draw:frame draw:style-name="BoxGraphic"
+                                svg:x="0cm" svg:y="0cm" svg:width="10cm" svg:height="2cm">
+                                <draw:text-box><text:p>Styled box</text:p></draw:text-box>
+                            </draw:frame>
+                        </draw:page>
+                    </office:presentation>
+                </office:body>
+            </office:document-content>
+        "##;
+        let parts = OdpDocumentParts {
+            content_xml: content_xml.to_owned(),
+            styles_xml: "<office:document-styles/>".to_owned(),
+        };
+        let styles = StyleContext::from_parts(&parts).expect("style context should parse");
+        let package = empty_package();
+
+        let slides = SlideImporter::new(&package, &styles)
+            .parse(content_xml)
+            .expect("slides should parse");
+
+        let text_box = &slides[0].boxes[0];
+        assert_eq!(text_box.style.fill, Color32::from_rgb(0x0c, 0x22, 0x38));
+        assert_eq!(text_box.style.stroke, Color32::from_rgb(0xc8, 0x78, 0x1e));
+        assert_eq!(text_box.style.stroke_kind, BoxStrokeKind::Solid);
+        assert_eq!(text_box.style.corner_radius, 0.0);
+        assert_close(
+            text_box.style.stroke_width,
+            parse_length("0.0547cm").unwrap(),
+        );
+    }
+
+    #[test]
+    fn resolves_text_box_graphic_style_inheritance() {
+        let xml = r##"
+            <office:automatic-styles>
+                <style:style style:name="ParentGraphic" style:family="graphic">
+                    <style:graphic-properties draw:fill-color="#112233"
+                        draw:stroke="none"/>
+                </style:style>
+                <style:style style:name="ChildGraphic" style:family="graphic"
+                    style:parent-style-name="ParentGraphic">
+                    <style:graphic-properties draw:stroke="solid" svg:stroke-color="#445566"/>
+                </style:style>
+            </office:automatic-styles>
+        "##;
+
+        let styles = parse_graphic_styles_from_documents(&[xml]).expect("graphic styles parse");
+        let mut box_style = BoxStyle::default();
+        box_style.fill = Color32::TRANSPARENT;
+        box_style.stroke = Color32::TRANSPARENT;
+        styles
+            .get("ChildGraphic")
+            .expect("child graphic style exists")
+            .apply_to_style(&mut box_style);
+
+        assert_eq!(box_style.fill, Color32::from_rgb(0x11, 0x22, 0x33));
+        assert_eq!(box_style.stroke, Color32::from_rgb(0x44, 0x55, 0x66));
+    }
+
+    #[test]
+    fn solid_line_reenables_parent_no_line_without_explicit_color() {
+        let xml = r##"
+            <office:automatic-styles>
+                <style:style style:name="NoLineParent" style:family="presentation">
+                    <style:graphic-properties draw:stroke="none" draw:fill="none"/>
+                </style:style>
+                <style:style style:name="SolidChild" style:family="presentation"
+                    style:parent-style-name="NoLineParent">
+                    <style:graphic-properties draw:stroke="solid" draw:fill-color="#81d41a"/>
+                </style:style>
+            </office:automatic-styles>
+        "##;
+
+        let styles = parse_graphic_styles_from_documents(&[xml]).expect("graphic styles parse");
+        let mut box_style = BoxStyle::default();
+        box_style.fill = Color32::TRANSPARENT;
+        box_style.stroke = Color32::TRANSPARENT;
+        styles
+            .get("SolidChild")
+            .expect("child graphic style exists")
+            .apply_to_style(&mut box_style);
+
+        assert_eq!(box_style.fill, Color32::from_rgb(0x81, 0xd4, 0x1a));
+        assert_eq!(box_style.stroke, default_odp_stroke_color());
+        assert_eq!(box_style.stroke_kind, BoxStrokeKind::Solid);
+    }
+
+    #[test]
+    fn parses_dashed_text_box_line_type() {
+        let xml = r##"
+            <office:automatic-styles>
+                <style:style style:name="DashedGraphic" style:family="graphic">
+                    <style:graphic-properties draw:stroke="dash"
+                        svg:stroke-color="#445566"/>
+                </style:style>
+            </office:automatic-styles>
+        "##;
+
+        let styles = parse_graphic_styles_from_documents(&[xml]).expect("graphic styles parse");
+        let mut box_style = BoxStyle::default();
+        box_style.fill = Color32::TRANSPARENT;
+        box_style.stroke = Color32::TRANSPARENT;
+        styles
+            .get("DashedGraphic")
+            .expect("dashed graphic style exists")
+            .apply_to_style(&mut box_style);
+
+        assert_eq!(box_style.stroke, Color32::from_rgb(0x44, 0x55, 0x66));
+        assert_eq!(box_style.stroke_kind, BoxStrokeKind::Dash);
+    }
+
+    #[test]
     fn loads_text_alignment_from_frame_and_paragraph_styles() {
         let content_xml = r#"
             <office:document-content>
@@ -1535,6 +1886,7 @@ mod tests {
         let styles = StyleContext {
             page_size: DEFAULT_SLIDE_SIZE,
             text_styles: HashMap::new(),
+            graphic_styles: HashMap::new(),
             paragraph_alignments: HashMap::from([
                 ("FrameCentered".to_owned(), TextAlignment::Center),
                 ("ParagraphRight".to_owned(), TextAlignment::Right),
@@ -1582,6 +1934,7 @@ mod tests {
         let styles = StyleContext {
             page_size: DEFAULT_SLIDE_SIZE,
             text_styles: HashMap::new(),
+            graphic_styles: HashMap::new(),
             paragraph_alignments: HashMap::new(),
             text_vertical_alignments: HashMap::from([
                 ("TopAligned".to_owned(), TextVerticalAlignment::Top),
@@ -1831,6 +2184,7 @@ mod tests {
         let styles = StyleContext {
             page_size: DEFAULT_SLIDE_SIZE,
             text_styles: HashMap::new(),
+            graphic_styles: HashMap::new(),
             paragraph_alignments: HashMap::new(),
             text_vertical_alignments: HashMap::new(),
         };

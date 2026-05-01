@@ -1375,46 +1375,15 @@ impl RenderBox {
                 block.paint_rotated(painter, rect, &self.style, zoom, self.rotation, self.id);
             }
             RenderBoxKind::Text(block) => {
-                if self.style.fill != Color32::TRANSPARENT {
-                    painter.rect_filled(rect, radius, self.style.fill);
-                }
-                if self.style.stroke != Color32::TRANSPARENT && self.style.stroke_width > 0.0 {
-                    painter.rect_stroke(
-                        rect,
-                        radius,
-                        Stroke::new(
-                            (self.style.stroke_width * zoom).clamp(1.0, 2.0),
-                            self.style.stroke,
-                        ),
-                        StrokeKind::Inside,
-                    );
-                }
+                paint_box_background_and_stroke(painter, rect, radius, &self.style, zoom);
                 block.paint(painter, rect, &self.style, zoom)
             }
             RenderBoxKind::Image(block) => {
-                painter.rect_filled(rect, radius, self.style.fill);
-                painter.rect_stroke(
-                    rect,
-                    radius,
-                    Stroke::new(
-                        (self.style.stroke_width * zoom).clamp(1.0, 2.0),
-                        self.style.stroke,
-                    ),
-                    StrokeKind::Inside,
-                );
+                paint_box_background_and_stroke(painter, rect, radius, &self.style, zoom);
                 block.paint(painter, rect, self.id)
             }
             RenderBoxKind::Table(block) => {
-                painter.rect_filled(rect, radius, self.style.fill);
-                painter.rect_stroke(
-                    rect,
-                    radius,
-                    Stroke::new(
-                        (self.style.stroke_width * zoom).clamp(1.0, 2.0),
-                        self.style.stroke,
-                    ),
-                    StrokeKind::Inside,
-                );
+                paint_box_background_and_stroke(painter, rect, radius, &self.style, zoom);
                 block.paint(painter, rect, &self.style, zoom)
             }
             RenderBoxKind::Container => {}
@@ -1553,6 +1522,79 @@ impl RenderBox {
         let max_width = (self.size.x * self.scale.x - self.style.padding.x * 2.0).max(80.0);
         let job = block.layout_job(max_width, 1.0, painter.ctx().style().as_ref());
         Some(painter.layout_job(job))
+    }
+}
+
+fn paint_box_background_and_stroke(
+    painter: &Painter,
+    rect: Rect,
+    radius: f32,
+    style: &BoxStyle,
+    zoom: f32,
+) {
+    if style.fill != Color32::TRANSPARENT {
+        painter.rect_filled(rect, radius, style.fill);
+    }
+
+    if style.stroke == Color32::TRANSPARENT || style.stroke_width <= 0.0 {
+        return;
+    }
+
+    let stroke = Stroke::new((style.stroke_width * zoom).max(0.5), style.stroke);
+    match style.stroke_kind {
+        BoxStrokeKind::Solid => {
+            painter.rect_stroke(rect, radius, stroke, StrokeKind::Inside);
+        }
+        BoxStrokeKind::Dash => paint_dashed_rect(painter, rect, stroke, zoom),
+    }
+}
+
+fn paint_dashed_rect(painter: &Painter, rect: Rect, stroke: Stroke, zoom: f32) {
+    let inset = stroke.width * 0.5;
+    let rect = rect.shrink(inset);
+    let dash = (6.0 * zoom).max(stroke.width * 2.0);
+    let gap = (4.0 * zoom).max(stroke.width);
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+
+    for index in 0..corners.len() {
+        paint_dashed_line(
+            painter,
+            corners[index],
+            corners[(index + 1) % corners.len()],
+            stroke,
+            dash,
+            gap,
+        );
+    }
+}
+
+fn paint_dashed_line(
+    painter: &Painter,
+    start: Pos2,
+    end: Pos2,
+    stroke: Stroke,
+    dash: f32,
+    gap: f32,
+) {
+    let vector = end - start;
+    let length = vector.length();
+    if length <= f32::EPSILON {
+        return;
+    }
+    let direction = vector / length;
+    let mut offset = 0.0;
+    while offset < length {
+        let dash_end = (offset + dash).min(length);
+        painter.line_segment(
+            [start + direction * offset, start + direction * dash_end],
+            stroke,
+        );
+        offset += dash + gap;
     }
 }
 
@@ -2556,9 +2598,16 @@ pub struct BoxStyle {
     pub fill: Color32,
     pub stroke: Color32,
     pub stroke_width: f32,
+    pub stroke_kind: BoxStrokeKind,
     pub padding: Vec2,
     pub outer_margin: Vec2,
     pub corner_radius: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxStrokeKind {
+    Solid,
+    Dash,
 }
 
 impl Default for BoxStyle {
@@ -2567,6 +2616,7 @@ impl Default for BoxStyle {
             fill: Color32::from_rgb(255, 252, 248),
             stroke: Color32::from_rgb(170, 176, 184),
             stroke_width: 1.0,
+            stroke_kind: BoxStrokeKind::Solid,
             padding: vec2(18.0, 16.0),
             outer_margin: vec2(0.0, 16.0),
             corner_radius: 10.0,

@@ -11,7 +11,7 @@ use egui::{
     Align, Align2, Color32, ColorImage, FontFamily, FontId, FontSelection, Galley, Painter, Pos2,
     Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind, Style, TextureHandle,
     TextureOptions, Ui, Vec2,
-    epaint::{Mesh, Vertex},
+    epaint::{Mesh, Vertex, text::PlacedRow},
     text::{CCursor, LayoutJob, TextWrapping},
     vec2,
 };
@@ -1430,12 +1430,20 @@ impl RenderBox {
     ) -> Option<Rect> {
         let galley = self.text_galley_from_painter(painter)?;
         let rect = self.rect(origin, zoom);
-        let text_origin = match &self.kind {
-            RenderBoxKind::Text(block) => {
-                block.text_origin(rect, &self.style, zoom, galley.size().y * zoom)
-            }
-            _ => rect.min + self.style.padding * zoom,
+        if let RenderBoxKind::Text(block) = &self.kind {
+            let text_origin = block.text_origin(rect, &self.style, zoom, galley.size().y * zoom);
+            let row =
+                block.painted_row_for_index(&galley, char_index, zoom, painter, text_origin)?;
+            let cursor_rect = row.galley.pos_from_cursor(CCursor::new(row.local_index));
+            let min = row.origin + cursor_rect.min.to_vec2();
+            let max = row.origin + cursor_rect.max.to_vec2();
+            let height = (max.y - min.y).max(8.0 * zoom);
+            return Some(Rect::from_min_size(
+                Pos2::new(min.x - 0.75 * zoom, min.y),
+                vec2(1.5 * zoom, height),
+            ));
         };
+        let text_origin = rect.min + self.style.padding * zoom;
         let cursor_rect = galley.pos_from_cursor(CCursor::new(char_index));
         let min = text_origin + cursor_rect.min.to_vec2() * zoom;
         let max = text_origin + cursor_rect.max.to_vec2() * zoom;
@@ -1476,11 +1484,24 @@ impl RenderBox {
             if sel_start < sel_end {
                 let local_start = sel_start - row_start;
                 let local_end = sel_end - row_start;
-                let x0 = row.pos.x + row.x_offset(local_start);
-                let x1 = row.pos.x + row.x_offset(local_end);
-                let min = text_origin + vec2(x0, row.min_y()) * zoom;
-                let max = text_origin + vec2(x1, row.max_y()) * zoom;
-                rects.push(Rect::from_min_max(min, max));
+                if let RenderBoxKind::Text(block) = &self.kind {
+                    let painted_row =
+                        block.painted_row(&galley, row, row_start, zoom, painter, text_origin);
+                    if let Some(painted_row) = painted_row {
+                        let painted = &painted_row.galley.rows[0];
+                        let x0 = painted.x_offset(local_start);
+                        let x1 = painted.x_offset(local_end);
+                        let min = painted_row.origin + vec2(x0, painted.min_y());
+                        let max = painted_row.origin + vec2(x1, painted.max_y());
+                        rects.push(Rect::from_min_max(min, max));
+                    }
+                } else {
+                    let x0 = row.pos.x + row.x_offset(local_start);
+                    let x1 = row.pos.x + row.x_offset(local_end);
+                    let min = text_origin + vec2(x0, row.min_y()) * zoom;
+                    let max = text_origin + vec2(x1, row.max_y()) * zoom;
+                    rects.push(Rect::from_min_max(min, max));
+                }
             }
             row_start = row_end;
         }
@@ -1507,6 +1528,9 @@ impl RenderBox {
             }
             _ => rect.min + self.style.padding * zoom,
         };
+        if let RenderBoxKind::Text(block) = &self.kind {
+            return block.painted_caret_index_at(&galley, pointer_pos, zoom, painter, text_origin);
+        }
         let local_pos = (pointer_pos - text_origin) / zoom.max(0.001);
         Some(galley.cursor_from_pos(local_pos).index)
     }
@@ -1551,6 +1575,12 @@ pub struct RichTextBlock {
     pub runs: Vec<TextRun>,
     pub alignment: TextAlignment,
     pub vertical_alignment: TextVerticalAlignment,
+}
+
+struct PaintedTextRow {
+    origin: Pos2,
+    galley: Arc<Galley>,
+    local_index: usize,
 }
 
 impl RichTextBlock {
@@ -1930,6 +1960,109 @@ impl RichTextBlock {
         }
 
         job
+    }
+
+    fn painted_row_for_index(
+        &self,
+        galley: &Galley,
+        char_index: usize,
+        zoom: f32,
+        painter: &Painter,
+        text_origin: Pos2,
+    ) -> Option<PaintedTextRow> {
+        let mut row_start = 0usize;
+        let mut fallback = None;
+
+        for row in &galley.rows {
+            let row_end = row_start + row.char_count_including_newline();
+            let row_content_end = row_start + row.char_count_excluding_newline();
+            let painted_row = self.painted_row(galley, row, row_start, zoom, painter, text_origin);
+            if char_index <= row_end {
+                return painted_row.map(|mut painted_row| {
+                    painted_row.local_index = char_index
+                        .saturating_sub(row_start)
+                        .min(row_content_end.saturating_sub(row_start));
+                    painted_row
+                });
+            }
+            fallback = painted_row.map(|mut painted_row| {
+                painted_row.local_index = row_content_end.saturating_sub(row_start);
+                painted_row
+            });
+            row_start = row_end;
+        }
+
+        fallback
+    }
+
+    fn painted_row(
+        &self,
+        _galley: &Galley,
+        row: &PlacedRow,
+        row_start: usize,
+        zoom: f32,
+        painter: &Painter,
+        text_origin: Pos2,
+    ) -> Option<PaintedTextRow> {
+        let styled_chars = self.styled_chars();
+        let row_content_end = row_start + row.char_count_excluding_newline();
+        let slice_start = row_start.min(styled_chars.len());
+        let slice_end = row_content_end.min(styled_chars.len());
+        let row_job = self.layout_job_for_chars(
+            &styled_chars[slice_start..slice_end],
+            zoom,
+            painter.ctx().style().as_ref(),
+        );
+        let row_galley = painter.layout_job(row_job);
+        if row_galley.rows.is_empty() {
+            return None;
+        }
+
+        Some(PaintedTextRow {
+            origin: text_origin + vec2(row.pos.x, row.min_y()) * zoom,
+            galley: row_galley,
+            local_index: 0,
+        })
+    }
+
+    fn painted_caret_index_at(
+        &self,
+        galley: &Galley,
+        pointer_pos: Pos2,
+        zoom: f32,
+        painter: &Painter,
+        text_origin: Pos2,
+    ) -> Option<usize> {
+        let mut row_start = 0usize;
+        let mut best: Option<(f32, usize)> = None;
+
+        for row in &galley.rows {
+            let row_end = row_start + row.char_count_including_newline();
+            let row_content_end = row_start + row.char_count_excluding_newline();
+            if let Some(painted_row) =
+                self.painted_row(galley, row, row_start, zoom, painter, text_origin)
+            {
+                let painted = &painted_row.galley.rows[0];
+                let row_min_y = painted_row.origin.y + painted.min_y();
+                let row_max_y = painted_row.origin.y + painted.max_y();
+                let distance = if pointer_pos.y < row_min_y {
+                    row_min_y - pointer_pos.y
+                } else if pointer_pos.y > row_max_y {
+                    pointer_pos.y - row_max_y
+                } else {
+                    0.0
+                };
+                let local_pos = pointer_pos - painted_row.origin;
+                let local_index = painted_row.galley.cursor_from_pos(local_pos).index;
+                let index = row_start + local_index.min(row_content_end.saturating_sub(row_start));
+                if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+                    best = Some((distance, index.min(row_end)));
+                }
+            }
+            row_start = row_end;
+        }
+
+        best.map(|(_, index)| index)
     }
 
     fn styled_chars(&self) -> Vec<(char, TextStyle)> {

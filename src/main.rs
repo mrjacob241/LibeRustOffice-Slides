@@ -1,6 +1,7 @@
 use eframe::{App, Frame, NativeOptions, egui};
 mod odp_loader;
 mod odp_saver;
+mod pdf_exporter;
 use rich_canvas::{
     AnimationSpec, CanvasMode, CanvasSelection, ImageResizeHandle, LayoutRole, RenderBox,
     RichCanvas, TableBlock, TextAlignment, TextRange, TextRun, TextStyle, TextStyleState,
@@ -230,6 +231,33 @@ impl LibeRustOfficeSlidesApp {
         }
     }
 
+    fn export_pdf_as(&mut self) {
+        let suggested_name = self
+            .document_name
+            .strip_suffix(".odp")
+            .map(|name| format!("{name}.pdf"))
+            .unwrap_or_else(|| "slides.pdf".to_owned());
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Portable Document Format", &["pdf"])
+            .set_file_name(suggested_name)
+            .save_file()
+        {
+            self.export_pdf_to_path(&path);
+        }
+    }
+
+    fn export_pdf_to_path(&mut self, path: &Path) {
+        self.sync_active_slide();
+        match pdf_exporter::export_pdf(path, &self.slides) {
+            Ok(()) => {
+                self.status = format!("Exported PDF {}", path.display());
+            }
+            Err(error) => {
+                self.status = format!("PDF export failed: {error}");
+            }
+        }
+    }
+
     fn save_odp_to_path(&mut self, path: &Path) {
         self.sync_active_slide();
         match odp_saver::save_odp(path, &self.slides) {
@@ -319,6 +347,12 @@ impl LibeRustOfficeSlidesApp {
                 self.save_odp_as();
                 ui.close();
             }
+            ui.menu_button("Export...", |ui| {
+                if ui.button("PDF").clicked() {
+                    self.export_pdf_as();
+                    ui.close();
+                }
+            });
         });
     }
 

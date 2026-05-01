@@ -958,6 +958,11 @@ impl<'a> SlideImporter<'a> {
                         .decode()
                         .map_err(|error| OdpLoadError::Xml(error.to_string()))?;
                     if decoded.trim().is_empty() {
+                        if !decoded.contains('\n') && !decoded.contains('\r') {
+                            if let Some(import) = frame.as_mut() {
+                                import.push_text(decoded.as_ref(), current_style(&style_stack));
+                            }
+                        }
                         continue;
                     }
                     if let Some(import) = frame.as_mut() {
@@ -1281,6 +1286,12 @@ mod tests {
                 .runs
                 .iter()
                 .any(|run| run.text.contains("Highlight") && run.style.background_color.is_some())
+        }));
+        assert!(loaded.slides[1].boxes.iter().any(|render_box| {
+            let RenderBoxKind::Text(block) = &render_box.kind else {
+                return false;
+            };
+            block.plain_text().contains("Red, Highlight.")
         }));
         assert!(loaded.slides[1].boxes.iter().any(RenderBox::is_image));
     }

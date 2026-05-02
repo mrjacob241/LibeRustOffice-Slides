@@ -13,8 +13,8 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 use rich_canvas::{
-    BoxStrokeKind, BoxStyle, CanvasMode, ImageBlock, LayoutRole, RenderBox, RenderBoxKind,
-    RichCanvas, TextAlignment, TextRun, TextStyle, TextVerticalAlignment,
+    BoxStrokeKind, BoxStyle, ImageBlock, LayoutRole, RenderBox, RenderBoxKind, RichCanvas,
+    TextAlignment, TextRun, TextStyle, TextVerticalAlignment,
 };
 
 const ODP_MIME_TYPE: &str = "application/vnd.oasis.opendocument.presentation";
@@ -89,7 +89,13 @@ impl OdpImporter {
         }
 
         for slide in &mut slides {
-            slide.relayout(CanvasMode::SlideDeck);
+            for render_box in &mut slide.boxes {
+                if matches!(render_box.kind, RenderBoxKind::Text(_))
+                    && render_box.style.fill == Color32::TRANSPARENT
+                {
+                    render_box.measure();
+                }
+            }
         }
 
         Ok(LoadedOdp {
@@ -131,6 +137,7 @@ impl OdpDocumentParts {
 
 struct StyleContext {
     page_size: Vec2,
+    master_pages: HashMap<String, MasterPage>,
     text_styles: HashMap<String, TextStyleDef>,
     graphic_styles: HashMap<String, GraphicStyleDef>,
     paragraph_alignments: HashMap<String, TextAlignment>,
@@ -140,9 +147,10 @@ struct StyleContext {
 impl StyleContext {
     fn from_parts(parts: &OdpDocumentParts) -> Result<Self, OdpLoadError> {
         let page_layouts = parse_page_layouts(&parts.styles_xml)?;
-        let master_pages = parse_master_pages(&parts.styles_xml)?;
+        let master_pages = parse_master_pages(&parts.styles_xml, &page_layouts)?;
         Ok(Self {
             page_size: default_page_size(&master_pages, &page_layouts),
+            master_pages,
             text_styles: parse_text_styles_from_documents(&[
                 &parts.styles_xml,
                 &parts.content_xml,
@@ -344,6 +352,19 @@ struct PageLayout {
     size: Vec2,
 }
 
+#[derive(Clone, Debug)]
+struct MasterPage {
+    page_layout_name: String,
+    background_images: Vec<MasterBackgroundImage>,
+}
+
+#[derive(Clone, Debug)]
+struct MasterBackgroundImage {
+    position: Pos2,
+    size: Vec2,
+    href: String,
+}
+
 fn parse_page_layouts(xml: &str) -> Result<HashMap<String, PageLayout>, OdpLoadError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -386,21 +407,212 @@ fn parse_page_layouts(xml: &str) -> Result<HashMap<String, PageLayout>, OdpLoadE
     Ok(layouts)
 }
 
-fn parse_master_pages(xml: &str) -> Result<HashMap<String, String>, OdpLoadError> {
+fn parse_fill_images(xml: &str) -> Result<HashMap<String, String>, OdpLoadError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-    let mut masters = HashMap::new();
+    let mut fill_images = HashMap::new();
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(event)) | Ok(Event::Empty(event))
-                if local_name(event.name().as_ref()) == b"master-page" =>
+                if local_name(event.name().as_ref()) == b"fill-image" =>
             {
+                if let (Some(name), Some(href)) = (
+                    attr(&event, reader.decoder(), b"name"),
+                    attr(&event, reader.decoder(), b"href"),
+                ) {
+                    fill_images.insert(name, href);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(OdpLoadError::Xml(error.to_string())),
+            _ => {}
+        }
+    }
+
+    Ok(fill_images)
+}
+
+fn parse_drawing_page_backgrounds(
+    xml: &str,
+    fill_images: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, OdpLoadError> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut backgrounds = HashMap::new();
+    let mut active_style = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) if local_name(event.name().as_ref()) == b"style" => {
+                active_style = (attr(&event, reader.decoder(), b"family").as_deref()
+                    == Some("drawing-page"))
+                .then(|| attr(&event, reader.decoder(), b"name"))
+                .flatten();
+            }
+            Ok(Event::Empty(event)) | Ok(Event::Start(event))
+                if active_style.is_some()
+                    && local_name(event.name().as_ref()) == b"drawing-page-properties" =>
+            {
+                if attr(&event, reader.decoder(), b"fill").as_deref() == Some("bitmap") {
+                    if let (Some(style_name), Some(href)) = (
+                        active_style.as_ref(),
+                        attr(&event, reader.decoder(), b"fill-image-name")
+                            .and_then(|name| fill_images.get(&name).cloned()),
+                    ) {
+                        backgrounds.insert(style_name.clone(), href);
+                    }
+                }
+            }
+            Ok(Event::End(event)) if local_name(event.name().as_ref()) == b"style" => {
+                active_style = None;
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(OdpLoadError::Xml(error.to_string())),
+            _ => {}
+        }
+    }
+
+    Ok(backgrounds)
+}
+
+fn parse_master_pages(
+    xml: &str,
+    page_layouts: &HashMap<String, PageLayout>,
+) -> Result<HashMap<String, MasterPage>, OdpLoadError> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let fill_images = parse_fill_images(xml)?;
+    let drawing_page_backgrounds = parse_drawing_page_backgrounds(xml, &fill_images)?;
+    let mut masters = HashMap::new();
+    let mut active_master = None;
+    let mut active_frame = None;
+    let mut in_master_notes = 0usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) if local_name(event.name().as_ref()) == b"master-page" => {
                 if let (Some(name), Some(layout)) = (
                     attr(&event, reader.decoder(), b"name"),
                     attr(&event, reader.decoder(), b"page-layout-name"),
                 ) {
-                    masters.insert(name, layout);
+                    let style_background =
+                        attr_qualified(&event, reader.decoder(), b"draw:style-name")
+                            .and_then(|style_name| {
+                                drawing_page_backgrounds.get(&style_name).cloned()
+                            })
+                            .map(|href| MasterBackgroundImage {
+                                position: Pos2::ZERO,
+                                size: page_layouts
+                                    .get(&layout)
+                                    .map(|page_layout| page_layout.size)
+                                    .unwrap_or(DEFAULT_SLIDE_SIZE),
+                                href,
+                            });
+                    active_master = Some((
+                        name,
+                        MasterPage {
+                            page_layout_name: layout,
+                            background_images: Vec::new(),
+                        },
+                        style_background,
+                    ));
+                }
+            }
+            Ok(Event::Empty(event)) if local_name(event.name().as_ref()) == b"master-page" => {
+                if let (Some(name), Some(layout)) = (
+                    attr(&event, reader.decoder(), b"name"),
+                    attr(&event, reader.decoder(), b"page-layout-name"),
+                ) {
+                    let mut background_images = Vec::new();
+                    if let Some(background) =
+                        attr_qualified(&event, reader.decoder(), b"draw:style-name")
+                            .and_then(|style_name| {
+                                drawing_page_backgrounds.get(&style_name).cloned()
+                            })
+                            .map(|href| MasterBackgroundImage {
+                                position: Pos2::ZERO,
+                                size: page_layouts
+                                    .get(&layout)
+                                    .map(|page_layout| page_layout.size)
+                                    .unwrap_or(DEFAULT_SLIDE_SIZE),
+                                href,
+                            })
+                    {
+                        background_images.push(background);
+                    }
+                    masters.insert(
+                        name,
+                        MasterPage {
+                            page_layout_name: layout,
+                            background_images,
+                        },
+                    );
+                }
+            }
+            Ok(Event::End(event)) if local_name(event.name().as_ref()) == b"master-page" => {
+                if let Some((name, mut master, style_background)) = active_master.take() {
+                    if master.background_images.is_empty() {
+                        if let Some(background) = style_background {
+                            master.background_images.push(background);
+                        }
+                    }
+                    masters.insert(name, master);
+                }
+                in_master_notes = 0;
+            }
+            Ok(Event::Start(event))
+                if active_master.is_some() && local_name(event.name().as_ref()) == b"notes" =>
+            {
+                in_master_notes += 1;
+            }
+            Ok(Event::End(event))
+                if active_master.is_some() && local_name(event.name().as_ref()) == b"notes" =>
+            {
+                in_master_notes = in_master_notes.saturating_sub(1);
+            }
+            Ok(Event::Start(event))
+                if active_master.is_some()
+                    && in_master_notes == 0
+                    && local_name(event.name().as_ref()) == b"frame" =>
+            {
+                active_frame = Some(MasterBackgroundImage {
+                    position: pos2(
+                        attr(&event, reader.decoder(), b"x")
+                            .and_then(|v| parse_length(&v))
+                            .unwrap_or_default(),
+                        attr(&event, reader.decoder(), b"y")
+                            .and_then(|v| parse_length(&v))
+                            .unwrap_or_default(),
+                    ),
+                    size: vec2(
+                        attr(&event, reader.decoder(), b"width")
+                            .and_then(|v| parse_length(&v))
+                            .unwrap_or(DEFAULT_SLIDE_SIZE.x),
+                        attr(&event, reader.decoder(), b"height")
+                            .and_then(|v| parse_length(&v))
+                            .unwrap_or(DEFAULT_SLIDE_SIZE.y),
+                    ),
+                    href: String::new(),
+                });
+            }
+            Ok(Event::Start(event)) | Ok(Event::Empty(event))
+                if active_frame.is_some() && local_name(event.name().as_ref()) == b"image" =>
+            {
+                if let (Some(frame), Some(href)) = (
+                    active_frame.as_mut(),
+                    attr(&event, reader.decoder(), b"href"),
+                ) {
+                    frame.href = href;
+                }
+            }
+            Ok(Event::End(event)) if local_name(event.name().as_ref()) == b"frame" => {
+                if let (Some((_name, master, _style_background)), Some(frame)) =
+                    (active_master.as_mut(), active_frame.take())
+                {
+                    if !frame.href.is_empty() {
+                        master.background_images.push(frame);
+                    }
                 }
             }
             Ok(Event::Eof) => break,
@@ -413,12 +625,16 @@ fn parse_master_pages(xml: &str) -> Result<HashMap<String, String>, OdpLoadError
 }
 
 fn default_page_size(
-    master_pages: &HashMap<String, String>,
+    master_pages: &HashMap<String, MasterPage>,
     page_layouts: &HashMap<String, PageLayout>,
 ) -> Vec2 {
     master_pages
         .values()
-        .find_map(|layout_name| page_layouts.get(layout_name).map(|layout| layout.size))
+        .find_map(|master| {
+            page_layouts
+                .get(&master.page_layout_name)
+                .map(|layout| layout.size)
+        })
         .unwrap_or(DEFAULT_SLIDE_SIZE)
 }
 
@@ -710,15 +926,16 @@ fn parse_graphic_style_defs(xml: &str) -> Result<HashMap<String, GraphicStyleDef
                 if local_name(event.name().as_ref()) == b"graphic-properties" =>
             {
                 if let Some((_name, definition)) = active_style.as_mut() {
-                    if let Some(fill) = attr(&event, reader.decoder(), b"fill") {
-                        if fill == "none" {
-                            definition.fill = Some(None);
+                    match attr(&event, reader.decoder(), b"fill").as_deref() {
+                        Some("none") => definition.fill = Some(None),
+                        Some("solid") => {
+                            if let Some(fill_color) = attr(&event, reader.decoder(), b"fill-color")
+                                .and_then(|v| parse_color(&v))
+                            {
+                                definition.fill = Some(Some(fill_color));
+                            }
                         }
-                    }
-                    if let Some(fill_color) =
-                        attr(&event, reader.decoder(), b"fill-color").and_then(|v| parse_color(&v))
-                    {
-                        definition.fill = Some(Some(fill_color));
+                        _ => {}
                     }
                     if let Some(stroke) = attr(&event, reader.decoder(), b"stroke") {
                         match stroke.as_str() {
@@ -1036,14 +1253,18 @@ impl<'a> SlideImporter<'a> {
             match reader.read_event() {
                 Ok(Event::Start(event)) if local_name(event.name().as_ref()) == b"page" => {
                     if in_notes == 0 {
-                        canvas = Some(new_slide_canvas(self.styles.page_size));
+                        let mut slide = new_slide_canvas(self.styles.page_size);
+                        self.push_master_background_images(
+                            &mut slide,
+                            attr(&event, reader.decoder(), b"master-page-name").as_deref(),
+                        )?;
+                        canvas = Some(slide);
                         z_index = 0;
                     }
                 }
                 Ok(Event::End(event)) if local_name(event.name().as_ref()) == b"page" => {
                     if in_notes == 0 {
-                        if let Some(mut slide) = canvas.take() {
-                            slide.relayout(CanvasMode::SlideDeck);
+                        if let Some(slide) = canvas.take() {
                             slides.push(slide);
                         }
                     }
@@ -1148,6 +1369,15 @@ impl<'a> SlideImporter<'a> {
                         import.image_href = attr(&event, reader.decoder(), b"href");
                     }
                 }
+                Ok(Event::Start(event)) | Ok(Event::Empty(event))
+                    if frame.is_some()
+                        && text_depth > 0
+                        && local_name(event.name().as_ref()) == b"line-break" =>
+                {
+                    if let Some(import) = frame.as_mut() {
+                        import.push_inline_line_break(&style_stack);
+                    }
+                }
                 Ok(Event::Text(text)) if frame.is_some() && text_depth > 0 => {
                     let decoded = text
                         .decode()
@@ -1172,13 +1402,58 @@ impl<'a> SlideImporter<'a> {
 
         Ok(slides)
     }
+
+    fn push_master_background_images(
+        &mut self,
+        slide: &mut RichCanvas,
+        master_page_name: Option<&str>,
+    ) -> Result<(), OdpLoadError> {
+        let Some(master) = master_page_name.and_then(|name| self.styles.master_pages.get(name))
+        else {
+            return Ok(());
+        };
+
+        for (index, image) in master.background_images.iter().enumerate() {
+            let entry_name = image.href.trim_start_matches("./");
+            let bytes = self.package.entry_bytes(entry_name)?;
+            let image_block = ImageBlock::from_encoded_bytes(
+                PathBuf::from(entry_name),
+                &bytes,
+                Some(image.size),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                false,
+            )
+            .map_err(|error| {
+                OdpLoadError::InvalidPackage(format!(
+                    "image {entry_name} could not be decoded: {error}"
+                ))
+            })?;
+            let mut render_box = RenderBox::image(
+                self.next_box_id,
+                LayoutRole::Absolute,
+                entry_name,
+                image.size,
+            );
+            render_box.kind = RenderBoxKind::Image(image_block);
+            render_box.position = image.position;
+            render_box.size = image.size.max(Vec2::splat(24.0));
+            render_box.authored_size = Some(render_box.size);
+            render_box.z_index = -10_000 + index as i32;
+            slide.push(render_box);
+            self.next_box_id += 1;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 struct FrameImport {
     position: Pos2,
     size: Vec2,
-    class_name: Option<String>,
     alignment: Option<TextAlignment>,
     vertical_alignment: Option<TextVerticalAlignment>,
     text_style: Option<TextStyle>,
@@ -1206,7 +1481,6 @@ impl FrameImport {
                     .and_then(|v| parse_length(&v))
                     .unwrap_or(90.0),
             ),
-            class_name: attr(event, decoder, b"class"),
             alignment: None,
             vertical_alignment: None,
             text_style: None,
@@ -1247,6 +1521,7 @@ impl FrameImport {
                 let mut style = BoxStyle::default();
                 style.fill = Color32::TRANSPARENT;
                 style.stroke = Color32::TRANSPARENT;
+                style.padding.y = 0.0;
                 style.corner_radius = 0.0;
                 style
             });
@@ -1273,6 +1548,14 @@ impl FrameImport {
             return;
         }
         self.runs.push(TextRun::new(text, style));
+    }
+
+    fn push_inline_line_break(&mut self, style_stack: &[TextStyle]) {
+        if let Some(run) = self.runs.last_mut() {
+            run.text.push('\n');
+        } else {
+            self.push_text("\n", current_style(style_stack));
+        }
     }
 
     fn into_render_box(
@@ -1323,20 +1606,12 @@ impl FrameImport {
         if let Some(style) = self.box_style {
             render_box.style = style;
         }
+        render_box.lock_size = render_box.style.fill != Color32::TRANSPARENT;
         if let Some(alignment) = self.alignment {
             render_box.set_text_alignment(alignment);
         }
         if let Some(alignment) = self.vertical_alignment {
             render_box.set_text_vertical_alignment(alignment);
-        }
-        if self.class_name.as_deref() == Some("title") {
-            for run in match &mut render_box.kind {
-                RenderBoxKind::Text(block) => &mut block.runs,
-                _ => unreachable!(),
-            } {
-                run.style.font_size = run.style.font_size.max(44.0);
-                run.style.bold = true;
-            }
         }
         Ok(Some(render_box))
     }
@@ -1474,35 +1749,31 @@ mod tests {
     fn loads_default_odp_into_canvas_slides() {
         let loaded = load_default_odp().expect("default ODP should load");
         assert_eq!(loaded.document_name, "test_slides.odp");
-        assert_eq!(loaded.slides.len(), 2);
+        assert_eq!(loaded.slides.len(), 3);
         assert!(loaded.slides.iter().all(|slide| !slide.boxes.is_empty()));
+        assert!(loaded.slides[0].boxes.iter().any(|render_box| {
+            render_box.is_image() && render_box.z_index < 0 && render_box.position == Pos2::ZERO
+        }));
         assert!(
             loaded.slides[0]
                 .boxes
                 .iter()
-                .any(|render_box| render_box.plain_text().as_deref() == Some("Test Slides"))
+                .any(|render_box| render_box.plain_text().as_deref()
+                    == Some("This is a Sample slides set"))
         );
         assert!(loaded.slides[0].boxes.iter().any(|render_box| matches!(
             &render_box.kind,
             RenderBoxKind::Text(block)
-                if block.plain_text() == "Test Slides" && block.alignment == TextAlignment::Center
+                if block.plain_text() == "This is a Sample slides set"
         )));
-        let title_box = loaded.slides[0]
-            .boxes
-            .iter()
-            .find(|render_box| render_box.plain_text().as_deref() == Some("Test Slides"))
-            .expect("first slide title should load");
-        assert_eq!(title_box.style.fill, Color32::from_rgb(0x81, 0xd4, 0x1a));
-        assert_ne!(title_box.style.stroke, Color32::TRANSPARENT);
-        assert_eq!(title_box.style.corner_radius, 0.0);
         let subtitle_style = loaded.slides[0].boxes.iter().find_map(|render_box| {
             let RenderBoxKind::Text(block) = &render_box.kind else {
                 return None;
             };
-            (block.plain_text() == "Just a sample of test slides").then_some(&block.runs[0].style)
+            (block.plain_text() == "(Lorem ipsum preset)").then_some(&block.runs[0].style)
         });
         let subtitle_style = subtitle_style.expect("first slide subtitle should load");
-        assert_close(subtitle_style.font_size, 32.0 * PX_PER_IN / 72.0);
+        assert_close(subtitle_style.font_size, 24.0 * PX_PER_IN / 72.0);
         assert!(loaded.slides[1].boxes.iter().any(|render_box| {
             let RenderBoxKind::Text(block) = &render_box.kind else {
                 return false;
@@ -1519,6 +1790,57 @@ mod tests {
             block.plain_text().contains("Red, Highlight.")
         }));
         assert!(loaded.slides[1].boxes.iter().any(RenderBox::is_image));
+        assert!(loaded.slides[1].boxes.iter().any(|render_box| {
+            render_box.is_image() && render_box.z_index < 0 && render_box.position == Pos2::ZERO
+        }));
+        assert!(loaded.slides[2].boxes.iter().any(|render_box| {
+            render_box.is_image() && render_box.z_index < 0 && render_box.position == Pos2::ZERO
+        }));
+        let license_box = loaded.slides[2]
+            .boxes
+            .iter()
+            .find(|render_box| {
+                render_box
+                    .plain_text()
+                    .is_some_and(|text| text.contains("Creative Commons"))
+            })
+            .expect("third slide license text should load");
+        assert!(license_box.lock_size);
+        let locked_size = license_box.size;
+        let mut gui_slide = loaded.slides[2].clone();
+        gui_slide.relayout(rich_canvas::CanvasMode::SlideDeck);
+        let relaid_license_box = gui_slide
+            .boxes
+            .iter()
+            .find(|render_box| {
+                render_box
+                    .plain_text()
+                    .is_some_and(|text| text.contains("Creative Commons"))
+            })
+            .expect("third slide license text should survive relayout");
+        assert_eq!(relaid_license_box.size, locked_size);
+        assert!(matches!(
+            &relaid_license_box.kind,
+            RenderBoxKind::Text(block)
+                if block.vertical_alignment == TextVerticalAlignment::Center
+        ));
+    }
+
+    #[test]
+    fn legacy_title_keeps_inherited_center_vertical_alignment() {
+        let loaded = load_odp(Path::new("sample_docs/legacy/test_slides_legacy_1.odp"))
+            .expect("legacy ODP should load");
+        let title = loaded.slides[0]
+            .boxes
+            .iter()
+            .find(|render_box| render_box.plain_text().as_deref() == Some("Test Slides"))
+            .expect("legacy first slide title should load");
+
+        assert!(matches!(
+            &title.kind,
+            RenderBoxKind::Text(block)
+                if block.vertical_alignment == TextVerticalAlignment::Center
+        ));
     }
 
     #[test]
@@ -1555,7 +1877,7 @@ mod tests {
         "#;
 
         let layouts = parse_page_layouts(xml).expect("page layouts should parse");
-        let masters = parse_master_pages(xml).expect("master pages should parse");
+        let masters = parse_master_pages(xml, &layouts).expect("master pages should parse");
         let page_size = default_page_size(&masters, &layouts);
 
         assert_close(page_size.x, 1280.0);
@@ -1684,6 +2006,7 @@ mod tests {
         let package = empty_package();
         let styles = StyleContext {
             page_size: DEFAULT_SLIDE_SIZE,
+            master_pages: HashMap::new(),
             text_styles: HashMap::new(),
             graphic_styles: HashMap::new(),
             paragraph_alignments: HashMap::new(),
@@ -1699,7 +2022,43 @@ mod tests {
         assert_eq!(title.plain_text().as_deref(), Some("Visible title"));
         assert_close(title.position.x, PX_PER_CM);
         assert_close(title.position.y, PX_PER_CM * 2.0);
-        assert!(matches!(&title.kind, RenderBoxKind::Text(block) if block.runs[0].style.bold));
+        assert!(matches!(&title.kind, RenderBoxKind::Text(block) if !block.runs[0].style.bold));
+    }
+
+    #[test]
+    fn imports_inline_text_breaks() {
+        let content_xml = r#"
+            <office:document-content>
+                <office:body>
+                    <office:presentation>
+                        <draw:page draw:name="page1">
+                            <draw:frame svg:x="1cm" svg:y="2cm" svg:width="10cm" svg:height="3cm">
+                                <draw:text-box>
+                                    <text:p>License.<text:line-break/>It works</text:p>
+                                </draw:text-box>
+                            </draw:frame>
+                        </draw:page>
+                    </office:presentation>
+                </office:body>
+            </office:document-content>
+        "#;
+        let package = empty_package();
+        let styles = StyleContext {
+            page_size: DEFAULT_SLIDE_SIZE,
+            master_pages: HashMap::new(),
+            text_styles: HashMap::new(),
+            graphic_styles: HashMap::new(),
+            paragraph_alignments: HashMap::new(),
+            text_vertical_alignments: HashMap::new(),
+        };
+        let slides = SlideImporter::new(&package, &styles)
+            .parse(content_xml)
+            .expect("slides should parse");
+
+        assert_eq!(
+            slides[0].boxes[0].plain_text().as_deref(),
+            Some("License.\nIt works")
+        );
     }
 
     #[test]
@@ -1785,7 +2144,7 @@ mod tests {
         let xml = r##"
             <office:automatic-styles>
                 <style:style style:name="ParentGraphic" style:family="graphic">
-                    <style:graphic-properties draw:fill-color="#112233"
+                    <style:graphic-properties draw:fill="solid" draw:fill-color="#112233"
                         draw:stroke="none"/>
                 </style:style>
                 <style:style style:name="ChildGraphic" style:family="graphic"
@@ -1817,7 +2176,8 @@ mod tests {
                 </style:style>
                 <style:style style:name="SolidChild" style:family="presentation"
                     style:parent-style-name="NoLineParent">
-                    <style:graphic-properties draw:stroke="solid" draw:fill-color="#81d41a"/>
+                    <style:graphic-properties draw:stroke="solid" draw:fill="solid"
+                        draw:fill-color="#81d41a"/>
                 </style:style>
             </office:automatic-styles>
         "##;
@@ -1834,6 +2194,29 @@ mod tests {
         assert_eq!(box_style.fill, Color32::from_rgb(0x81, 0xd4, 0x1a));
         assert_eq!(box_style.stroke, default_odp_stroke_color());
         assert_eq!(box_style.stroke_kind, BoxStrokeKind::Solid);
+    }
+
+    #[test]
+    fn fill_color_without_solid_fill_does_not_enable_fill() {
+        let xml = r##"
+            <office:automatic-styles>
+                <style:style style:name="Graphic" style:family="presentation">
+                    <style:graphic-properties draw:fill-color="#ffffff" draw:stroke="none"/>
+                </style:style>
+            </office:automatic-styles>
+        "##;
+
+        let styles = parse_graphic_styles_from_documents(&[xml]).expect("graphic styles parse");
+        let mut box_style = BoxStyle::default();
+        box_style.fill = Color32::TRANSPARENT;
+        box_style.stroke = Color32::TRANSPARENT;
+        styles
+            .get("Graphic")
+            .expect("graphic style exists")
+            .apply_to_style(&mut box_style);
+
+        assert_eq!(box_style.fill, Color32::TRANSPARENT);
+        assert_eq!(box_style.stroke, Color32::TRANSPARENT);
     }
 
     #[test]
@@ -1885,6 +2268,7 @@ mod tests {
         let package = empty_package();
         let styles = StyleContext {
             page_size: DEFAULT_SLIDE_SIZE,
+            master_pages: HashMap::new(),
             text_styles: HashMap::new(),
             graphic_styles: HashMap::new(),
             paragraph_alignments: HashMap::from([
@@ -1933,6 +2317,7 @@ mod tests {
         let package = empty_package();
         let styles = StyleContext {
             page_size: DEFAULT_SLIDE_SIZE,
+            master_pages: HashMap::new(),
             text_styles: HashMap::new(),
             graphic_styles: HashMap::new(),
             paragraph_alignments: HashMap::new(),
@@ -2183,6 +2568,7 @@ mod tests {
         let package = empty_package();
         let styles = StyleContext {
             page_size: DEFAULT_SLIDE_SIZE,
+            master_pages: HashMap::new(),
             text_styles: HashMap::new(),
             graphic_styles: HashMap::new(),
             paragraph_alignments: HashMap::new(),

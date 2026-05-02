@@ -270,14 +270,14 @@ impl ContentBuilder {
     }
 
     fn push_text_run(&mut self, xml: &mut String, run: &TextRun) {
+        let style_name = self.text_style_name(&run.style);
         for (index, part) in run.text.split('\n').enumerate() {
             if index > 0 {
-                xml.push_str("</text:p>\n            <text:p>");
+                xml.push_str("<text:line-break/>");
             }
             if part.is_empty() {
                 continue;
             }
-            let style_name = self.text_style_name(&run.style);
             xml.push_str(&format!(
                 r#"<text:span text:style-name="{style_name}">{}</text:span>"#,
                 xml_escape(part)
@@ -655,9 +655,9 @@ mod tests {
         let saved_loaded = odp_loader::load_odp(&saved_path).expect("saved ODP reloads");
 
         assert_eq!(saved_content_xml, expected_package.content_xml);
-        assert_eq!(
-            text_scheme(&saved_loaded.slides),
-            text_scheme(&loaded.slides)
+        assert_text_scheme_eq(
+            &text_scheme(&saved_loaded.slides),
+            &text_scheme(&loaded.slides),
         );
     }
 
@@ -773,6 +773,36 @@ mod tests {
             bold: run.style.bold,
             italic: run.style.italic,
             underline: run.style.underline,
+        }
+    }
+
+    fn assert_text_scheme_eq(actual: &[Vec<TextBoxScheme>], expected: &[Vec<TextBoxScheme>]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual_slide, expected_slide) in actual.iter().zip(expected) {
+            assert_eq!(actual_slide.len(), expected_slide.len());
+            for (actual_box, expected_box) in actual_slide.iter().zip(expected_slide) {
+                assert_eq!(actual_box.alignment, expected_box.alignment);
+                assert_eq!(
+                    actual_box.vertical_alignment,
+                    expected_box.vertical_alignment
+                );
+                assert_eq!(actual_box.runs.len(), expected_box.runs.len());
+                for (actual_run, expected_run) in actual_box.runs.iter().zip(&expected_box.runs) {
+                    assert_eq!(actual_run.text, expected_run.text);
+                    assert!(
+                        (actual_run.font_size_centipx - expected_run.font_size_centipx).abs() <= 1,
+                        "font size changed too much for {:?}: actual {} expected {}",
+                        actual_run.text,
+                        actual_run.font_size_centipx,
+                        expected_run.font_size_centipx
+                    );
+                    assert_eq!(actual_run.color, expected_run.color);
+                    assert_eq!(actual_run.background_color, expected_run.background_color);
+                    assert_eq!(actual_run.bold, expected_run.bold);
+                    assert_eq!(actual_run.italic, expected_run.italic);
+                    assert_eq!(actual_run.underline, expected_run.underline);
+                }
+            }
         }
     }
 

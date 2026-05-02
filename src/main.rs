@@ -2,6 +2,7 @@ use eframe::{App, Frame, NativeOptions, egui};
 mod odp_loader;
 mod odp_saver;
 mod pdf_exporter;
+mod slide_screenshot;
 use rich_canvas::{
     AnimationSpec, BoxStrokeKind, CanvasMode, CanvasSelection, ImageResizeHandle, LayoutRole,
     RenderBox, RenderBoxKind, RichCanvas, TableBlock, TextAlignment, TextRange, TextRun, TextStyle,
@@ -2228,6 +2229,31 @@ fn configure_local_editor_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|arg| arg == "--capture-slide-screenshots") {
+        match slide_screenshot::render_default_odp_screenshots_and_compare_references() {
+            Ok(comparisons) => {
+                for comparison in comparisons {
+                    println!(
+                        "slide {}: rendered={} reference={} rendered_size={}x{} reference_size={}x{} dimensions_match={}",
+                        comparison.slide_index,
+                        comparison.rendered_path.display(),
+                        comparison.reference_path.display(),
+                        comparison.rendered_width,
+                        comparison.rendered_height,
+                        comparison.reference_width,
+                        comparison.reference_height,
+                        comparison.dimensions_match
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("slide screenshot capture failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 780.0]),
         ..Default::default()

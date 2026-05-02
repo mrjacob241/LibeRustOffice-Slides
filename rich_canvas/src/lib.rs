@@ -1009,6 +1009,7 @@ pub struct RenderBox {
     pub position: Pos2,
     pub size: Vec2,
     pub authored_size: Option<Vec2>,
+    pub lock_size: bool,
     pub scale: Vec2,
     pub rotation: f32,
     pub visible: bool,
@@ -1034,6 +1035,7 @@ impl RenderBox {
             position: Pos2::ZERO,
             size: vec2(320.0, 80.0),
             authored_size: Some(vec2(320.0, 80.0)),
+            lock_size: false,
             scale: vec2(1.0, 1.0),
             rotation: 0.0,
             visible: true,
@@ -1053,6 +1055,7 @@ impl RenderBox {
             position: Pos2::ZERO,
             size,
             authored_size: Some(size),
+            lock_size: false,
             scale: vec2(1.0, 1.0),
             rotation: 0.0,
             visible: true,
@@ -1078,6 +1081,7 @@ impl RenderBox {
             position: Pos2::ZERO,
             size,
             authored_size: Some(size),
+            lock_size: false,
             scale: vec2(1.0, 1.0),
             rotation: 0.0,
             visible: true,
@@ -1095,6 +1099,7 @@ impl RenderBox {
             position: Pos2::ZERO,
             size: vec2(360.0, 200.0),
             authored_size: Some(vec2(360.0, 200.0)),
+            lock_size: false,
             scale: vec2(1.0, 1.0),
             rotation: 0.0,
             visible: true,
@@ -1338,6 +1343,12 @@ impl RenderBox {
     pub fn measure(&mut self) {
         match &self.kind {
             RenderBoxKind::Text(block) => {
+                if self.lock_size {
+                    if let Some(size) = self.authored_size {
+                        self.size = size;
+                    }
+                    return;
+                }
                 // Text height is estimated from wrapped line count rather than real font metrics.
                 let content_width = (self.size.x - self.style.padding.x * 2.0).max(80.0);
                 let layout = block.layout_lines(content_width);

@@ -24,3 +24,4 @@ image.workspace = true
 quick-xml = "0.39.2"
 rich_canvas = { path = "rich_canvas" }
 rfd = "0.15"
+webbrowser = "1.2.1"

@@ -278,10 +278,18 @@ impl ContentBuilder {
             if part.is_empty() {
                 continue;
             }
-            xml.push_str(&format!(
+            let text = format!(
                 r#"<text:span text:style-name="{style_name}">{}</text:span>"#,
                 xml_escape(part)
-            ));
+            );
+            if let Some(href) = &run.style.hyperlink {
+                xml.push_str(&format!(
+                    r#"<text:a xlink:type="simple" xlink:href="{}">{text}</text:a>"#,
+                    xml_escape(href)
+                ));
+            } else {
+                xml.push_str(&text);
+            }
         }
     }
 

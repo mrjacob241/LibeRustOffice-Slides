@@ -23,6 +23,7 @@ const MAX_ENTRY_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_SLIDE_SIZE: Vec2 = Vec2::new(1280.0, 720.0);
 const PX_PER_CM: f32 = 1280.0 / 28.0;
 const PX_PER_IN: f32 = PX_PER_CM * 2.54;
+const HYPERLINK_COLOR: Color32 = Color32::from_rgb(0x05, 0x63, 0xc1);
 
 pub const DEFAULT_ODP_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/sample_docs/test_slides.odp");
@@ -1375,6 +1376,25 @@ impl<'a> SlideImporter<'a> {
                     style_stack.pop();
                 }
                 Ok(Event::Start(event))
+                    if frame.is_some()
+                        && text_depth > 0
+                        && local_name(event.name().as_ref()) == b"a" =>
+                {
+                    style_stack.push(hyperlink_style_for_event(
+                        &event,
+                        reader.decoder(),
+                        &self.styles.text_styles,
+                        current_style(&style_stack),
+                    ));
+                }
+                Ok(Event::End(event))
+                    if frame.is_some()
+                        && text_depth > 0
+                        && local_name(event.name().as_ref()) == b"a" =>
+                {
+                    style_stack.pop();
+                }
+                Ok(Event::Start(event))
                     if canvas.is_some()
                         && in_notes == 0
                         && local_name(event.name().as_ref()) == b"par" =>
@@ -2028,6 +2048,22 @@ fn style_for_event(
         definition.apply_to_style(&mut fallback);
     }
     fallback
+}
+
+fn hyperlink_style_for_event(
+    event: &BytesStart<'_>,
+    decoder: Decoder,
+    text_styles: &HashMap<String, TextStyleDef>,
+    fallback: TextStyle,
+) -> TextStyle {
+    let fallback_color = fallback.color;
+    let mut style = style_for_event(event, decoder, text_styles, fallback);
+    style.hyperlink = attr(event, decoder, b"href");
+    style.underline = true;
+    if style.color == fallback_color {
+        style.color = HYPERLINK_COLOR;
+    }
+    style
 }
 
 fn attr(event: &BytesStart<'_>, decoder: Decoder, local: &[u8]) -> Option<String> {
@@ -3204,6 +3240,54 @@ mod tests {
         assert_eq!(style.color, Color32::from_rgb(0xc9, 0x21, 0x1e));
         assert!(style.bold);
         assert!(style.italic);
+    }
+
+    #[test]
+    fn imports_text_hyperlinks_as_rendered_runs() {
+        let content_xml = r##"
+            <office:document-content>
+                <office:automatic-styles>
+                    <style:style style:name="LinkStyle" style:family="text">
+                        <style:text-properties fo:font-size="24pt"/>
+                    </style:style>
+                </office:automatic-styles>
+                <office:body>
+                    <office:presentation>
+                        <draw:page draw:name="page1">
+                            <draw:frame svg:x="0cm" svg:y="0cm" svg:width="10cm" svg:height="2cm">
+                                <draw:text-box>
+                                    <text:p>Visit <text:a xlink:href="https://example.com">
+                                        <text:span text:style-name="LinkStyle">Example</text:span>
+                                    </text:a></text:p>
+                                </draw:text-box>
+                            </draw:frame>
+                        </draw:page>
+                    </office:presentation>
+                </office:body>
+            </office:document-content>
+        "##;
+        let package = empty_package();
+        let styles = StyleContext::from_parts(&OdpDocumentParts {
+            content_xml: content_xml.to_owned(),
+            styles_xml: String::new(),
+        })
+        .expect("style context should parse");
+
+        let slides = SlideImporter::new(&package, &styles)
+            .parse(content_xml)
+            .expect("slides should parse");
+
+        let RenderBoxKind::Text(block) = &slides[0].boxes[0].kind else {
+            panic!("expected text box");
+        };
+        let link = block
+            .runs
+            .iter()
+            .find(|run| run.text.contains("Example"))
+            .expect("hyperlink text should import");
+        assert_eq!(link.style.hyperlink.as_deref(), Some("https://example.com"));
+        assert!(link.style.underline);
+        assert_eq!(link.style.color, HYPERLINK_COLOR);
     }
 
     #[test]

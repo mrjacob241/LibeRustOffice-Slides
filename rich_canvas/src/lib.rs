@@ -123,11 +123,19 @@ pub struct CanvasUiResponse {
     pub clicked_caret: Option<usize>,
     pub dragged_box: Option<u64>,
     pub dragged_caret: Option<usize>,
+    pub hovered_hyperlink: Option<CanvasHyperlink>,
     pub image_resize_handle: Option<ImageResizeHandle>,
     pub text_resize_handle: Option<ImageResizeHandle>,
     pub pointer_pos: Option<Pos2>,
     pub drag_started: bool,
     pub drag_stopped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanvasHyperlink {
+    pub box_id: u64,
+    pub char_index: usize,
+    pub url: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -450,6 +458,17 @@ impl RichCanvas {
                 (None, None)
             };
 
+            let hovered_hyperlink = response.hover_pos().and_then(|pointer| {
+                let box_id = self.hit_test(canvas_origin, pointer)?;
+                let char_index =
+                    self.text_caret_index_at(box_id, canvas_origin, pointer, &painter)?;
+                self.text_hyperlink_at(box_id, char_index)
+                    .map(|url| CanvasHyperlink {
+                        box_id,
+                        char_index,
+                        url,
+                    })
+            });
             let pointer = response.interact_pointer_pos();
             let image_resize_handle = selection.and_then(|selection| {
                 pointer.and_then(|pos| {
@@ -479,6 +498,7 @@ impl RichCanvas {
                     clicked_caret,
                     dragged_box,
                     dragged_caret,
+                    hovered_hyperlink,
                     image_resize_handle,
                     text_resize_handle,
                     pointer_pos: pointer,
@@ -699,6 +719,11 @@ impl RichCanvas {
                 painter,
             )
         })
+    }
+
+    pub fn text_hyperlink_at(&self, id: u64, char_index: usize) -> Option<String> {
+        self.box_ref(id)
+            .and_then(|render_box| render_box.hyperlink_at(char_index))
     }
 }
 
@@ -1517,6 +1542,13 @@ impl RenderBox {
         Some(galley.cursor_from_pos(local_pos).index)
     }
 
+    pub fn hyperlink_at(&self, char_index: usize) -> Option<String> {
+        let RenderBoxKind::Text(block) = &self.kind else {
+            return None;
+        };
+        block.hyperlink_at(char_index)
+    }
+
     fn text_galley(&self, ctx: &egui::Context) -> Option<Arc<Galley>> {
         let block = match &self.kind {
             RenderBoxKind::Text(block) => block,
@@ -2130,6 +2162,21 @@ impl RichTextBlock {
         chars
     }
 
+    fn hyperlink_at(&self, char_index: usize) -> Option<String> {
+        let chars = self.styled_chars();
+        if chars.is_empty() {
+            return None;
+        }
+
+        let index = char_index.min(chars.len().saturating_sub(1));
+        chars[index].1.hyperlink.clone().or_else(|| {
+            char_index
+                .checked_sub(1)
+                .and_then(|index| chars.get(index))
+                .and_then(|(_, style)| style.hyperlink.clone())
+        })
+    }
+
     fn rebuild_from_styled_chars(&mut self, chars: Vec<(char, TextStyle)>) {
         if chars.is_empty() {
             self.runs = vec![TextRun::new(
@@ -2302,6 +2349,7 @@ pub struct TextStyle {
     pub font_size: f32,
     pub color: Color32,
     pub background_color: Option<Color32>,
+    pub hyperlink: Option<String>,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -2341,6 +2389,7 @@ impl TextStyle {
             font_size: 32.0,
             color: Color32::from_rgb(36, 38, 41),
             background_color: None,
+            hyperlink: None,
             bold: false,
             italic: false,
             underline: false,
@@ -2352,6 +2401,7 @@ impl TextStyle {
             font_size: 20.0,
             color: Color32::from_rgb(62, 69, 77),
             background_color: None,
+            hyperlink: None,
             bold: false,
             italic: false,
             underline: false,
@@ -2363,6 +2413,7 @@ impl TextStyle {
             font_size: 22.0,
             color: Color32::from_rgb(181, 82, 38),
             background_color: None,
+            hyperlink: None,
             bold: false,
             italic: false,
             underline: false,
@@ -3085,6 +3136,30 @@ mod tests {
         assert_eq!(chars[2].1.font_size, 36.0);
         assert_eq!(chars[3].1.font_size, 36.0);
         assert_eq!(chars[4].1.font_size, 20.0);
+    }
+
+    #[test]
+    fn hyperlink_lookup_uses_current_or_previous_character() {
+        let mut link_style = TextStyle::body();
+        link_style.hyperlink = Some("https://example.com".to_owned());
+        let text_box = RenderBox::text(
+            1,
+            LayoutRole::Absolute,
+            vec![
+                TextRun::new("Go ", TextStyle::body()),
+                TextRun::new("there", link_style),
+            ],
+        );
+
+        assert_eq!(
+            text_box.hyperlink_at(3).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            text_box.hyperlink_at(8).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(text_box.hyperlink_at(1), None);
     }
 
     #[test]

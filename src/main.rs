@@ -13,6 +13,7 @@ use std::{
     fs::OpenOptions,
     io::Write,
     path::Path,
+    process::Command,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -2872,6 +2873,45 @@ impl App for LibeRustOfficeSlidesApp {
                 range: self.selection_range(),
             });
             let canvas_response = self.canvas.ui(ui, selection);
+            let hovered_hyperlink = canvas_response.hovered_hyperlink.clone();
+            if let Some(link) = &hovered_hyperlink {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                canvas_response
+                    .response
+                    .clone()
+                    .on_hover_ui_at_pointer(|ui| {
+                        ui.strong("Link");
+                        ui.label(&link.url);
+                    });
+            }
+            canvas_response.response.context_menu(|ui| {
+                if let Some(link) = &hovered_hyperlink {
+                    if ui.button("Open Link").clicked() {
+                        if is_supported_external_url(&link.url) {
+                            match open_link_with_fallbacks(&link.url) {
+                                Ok(method) => {
+                                    self.status =
+                                        format!("Opened link with {method}: {}", link.url);
+                                }
+                                Err(error) => {
+                                    self.status = format!("Open link failed: {error}");
+                                }
+                            }
+                        } else {
+                            self.status = format!("Open link failed: unsupported URL {}", link.url);
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Copy Link").clicked() {
+                        ctx.copy_text(link.url.clone());
+                        self.status = format!("Copied link {}", link.url);
+                        ui.close();
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new("Open Link"));
+                    ui.add_enabled(false, egui::Button::new("Copy Link"));
+                }
+            });
             if canvas_response.drag_started {
                 if let (Some(box_id), Some(handle), Some(pointer)) = (
                     self.selected_box,
@@ -3565,6 +3605,118 @@ fn configure_local_editor_fonts(ctx: &egui::Context) {
         vec!["editor_bold".into()],
     );
     ctx.set_fonts(fonts);
+}
+
+fn open_link_with_fallbacks(url: &str) -> Result<&'static str, String> {
+    if !is_supported_external_url(url) {
+        return Err(format!("unsupported URL scheme: {url}"));
+    }
+
+    let mut errors = Vec::new();
+
+    for launcher in platform_link_launchers().iter().copied() {
+        match spawn_link_launcher(launcher, url) {
+            Ok(()) => return Ok(launcher.name),
+            Err(error) => errors.push(format!("{}: {error}", launcher.name)),
+        }
+    }
+
+    match webbrowser::open(url) {
+        Ok(()) => Ok("webbrowser"),
+        Err(error) => {
+            errors.push(format!("webbrowser: {error}"));
+            Err(errors.join("; "))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LinkLauncher {
+    name: &'static str,
+    command: &'static str,
+    args_before_url: &'static [&'static str],
+}
+
+fn platform_link_launchers() -> &'static [LinkLauncher] {
+    #[cfg(target_os = "windows")]
+    {
+        &[
+            LinkLauncher {
+                name: "rundll32",
+                command: "rundll32",
+                args_before_url: &["url.dll,FileProtocolHandler"],
+            },
+            LinkLauncher {
+                name: "cmd start",
+                command: "cmd",
+                args_before_url: &["/C", "start", ""],
+            },
+        ]
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        &[LinkLauncher {
+            name: "open",
+            command: "open",
+            args_before_url: &[],
+        }]
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        &[
+            LinkLauncher {
+                name: "xdg-open",
+                command: "xdg-open",
+                args_before_url: &[],
+            },
+            LinkLauncher {
+                name: "gio open",
+                command: "gio",
+                args_before_url: &["open"],
+            },
+            LinkLauncher {
+                name: "kde-open5",
+                command: "kde-open5",
+                args_before_url: &[],
+            },
+            LinkLauncher {
+                name: "gnome-open",
+                command: "gnome-open",
+                args_before_url: &[],
+            },
+            LinkLauncher {
+                name: "sensible-browser",
+                command: "sensible-browser",
+                args_before_url: &[],
+            },
+            LinkLauncher {
+                name: "x-www-browser",
+                command: "x-www-browser",
+                args_before_url: &[],
+            },
+        ]
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    {
+        &[]
+    }
+}
+
+fn spawn_link_launcher(launcher: LinkLauncher, url: &str) -> Result<(), String> {
+    Command::new(launcher.command)
+        .args(launcher.args_before_url)
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn is_supported_external_url(url: &str) -> bool {
+    let url = url.trim();
+    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:")
 }
 
 fn main() -> eframe::Result<()> {

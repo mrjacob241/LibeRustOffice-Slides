@@ -13,9 +13,9 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 use rich_canvas::{
-    AnimationKind, AnimationSpec, BoxStrokeKind, BoxStyle, EntranceEffect, FlyInDirection,
-    ImageBlock, LayoutRole, RenderBox, RenderBoxKind, RichCanvas, TextAlignment, TextRun,
-    TextStyle, TextVerticalAlignment,
+    AnimationKind, AnimationSpec, BoxStrokeKind, BoxStyle, EmphasisEffect, EntranceEffect,
+    ExitEffect, FlyInDirection, ImageBlock, LayoutRole, RenderBox, RenderBoxKind, RichCanvas,
+    TextAlignment, TextRun, TextStyle, TextVerticalAlignment,
 };
 
 const ODP_MIME_TYPE: &str = "application/vnd.oasis.opendocument.presentation";
@@ -1584,6 +1584,12 @@ fn parse_animate_animation(
         if let Some(animation) = animation_from_preset(preset_id, duration, direction) {
             return Some((target, animation));
         }
+        if let Some(animation) = emphasis_animation_from_preset(preset_id, duration) {
+            return Some((target, animation));
+        }
+        if let Some(animation) = exit_animation_from_preset(preset_id, duration, direction) {
+            return Some((target, animation));
+        }
     }
 
     let direction = direction?;
@@ -1601,7 +1607,9 @@ fn parse_animate_transform_animation(
         .and_then(|value| parse_seconds(&value))
         .unwrap_or(0.5);
     let preset_id = preset_id?;
-    let animation = animation_from_preset(preset_id, duration, None)?;
+    let animation = animation_from_preset(preset_id, duration, None)
+        .or_else(|| emphasis_animation_from_preset(preset_id, duration))
+        .or_else(|| exit_animation_from_preset(preset_id, duration, None))?;
     Some((target, animation))
 }
 
@@ -1616,25 +1624,42 @@ fn parse_transition_filter_animation(
         .unwrap_or(0.5);
     let transition_preset = transition_filter_preset(event, decoder);
     let preset_id = preset_id.or(transition_preset.as_deref())?;
-    let animation = animation_from_preset(preset_id, duration, None)?;
+    let animation = animation_from_preset(preset_id, duration, None)
+        .or_else(|| emphasis_animation_from_preset(preset_id, duration))
+        .or_else(|| exit_animation_from_preset(preset_id, duration, None))?;
     Some((target, animation))
 }
 
 fn parse_set_animation(
     event: &BytesStart<'_>,
     decoder: Decoder,
-    _preset_id: Option<&str>,
+    preset_id: Option<&str>,
 ) -> Option<(String, AnimationSpec)> {
     let target = attr(event, decoder, b"targetElement")?;
+    let duration = attr(event, decoder, b"dur")
+        .and_then(|value| parse_seconds(&value))
+        .unwrap_or(0.001);
+    if let Some(preset_id) = preset_id {
+        if let Some(animation) = emphasis_animation_from_preset(preset_id, duration) {
+            return Some((target, animation));
+        }
+        if let Some(animation) = exit_animation_from_preset(preset_id, duration, None) {
+            return Some((target, animation));
+        }
+    }
+
     let attribute_name = attr(event, decoder, b"attributeName")?;
     let to = attr(event, decoder, b"to")?;
+    if attribute_name == "visibility" && to == "hidden" {
+        return Some((
+            target,
+            AnimationSpec::exit(ExitEffect::Disappear, None, duration),
+        ));
+    }
     if attribute_name != "visibility" || to != "visible" {
         return None;
     }
 
-    let duration = attr(event, decoder, b"dur")
-        .and_then(|value| parse_seconds(&value))
-        .unwrap_or(0.001);
     Some((target, AnimationSpec::entrance_appear(duration)))
 }
 
@@ -1703,6 +1728,80 @@ fn animation_from_preset(
     Some(AnimationSpec::entrance(effect, direction, duration))
 }
 
+fn emphasis_animation_from_preset(preset_id: &str, duration: f32) -> Option<AnimationSpec> {
+    let effect = match preset_id {
+        "ooo-emphasis-spin" => EmphasisEffect::Spin,
+        "ooo-emphasis-grow-shrink" => EmphasisEffect::GrowShrink,
+        "ooo-emphasis-pulse" => EmphasisEffect::Pulse,
+        "ooo-emphasis-flash-bulb" => EmphasisEffect::Pulse,
+        "ooo-emphasis-teeter" => EmphasisEffect::Teeter,
+        "ooo-emphasis-transparency" => EmphasisEffect::Transparency,
+        "ooo-emphasis-fill-color" => EmphasisEffect::FillColor,
+        "ooo-emphasis-line-color" => EmphasisEffect::LineColor,
+        "ooo-emphasis-font-color" => EmphasisEffect::FontColor,
+        "ooo-emphasis-bold-flash" => EmphasisEffect::BoldFlash,
+        "ooo-emphasis-blink" => EmphasisEffect::Blink,
+        "ooo-emphasis-color-pulse" => EmphasisEffect::ColorPulse,
+        "ooo-emphasis-grow-with-color" => EmphasisEffect::GrowWithColor,
+        "ooo-emphasis-lighten" => EmphasisEffect::Lighten,
+        "ooo-emphasis-desaturate" => EmphasisEffect::Desaturate,
+        "ooo-emphasis-wave" => EmphasisEffect::Wave,
+        "ooo-emphasis-flicker" => EmphasisEffect::Flicker,
+        "ooo-emphasis-vertical-highlight" => EmphasisEffect::VerticalHighlight,
+        "ooo-emphasis-horizontal-highlight" => EmphasisEffect::HorizontalHighlight,
+        _ => return None,
+    };
+    Some(AnimationSpec::emphasis(effect, duration))
+}
+
+fn exit_animation_from_preset(
+    preset_id: &str,
+    duration: f32,
+    direction: Option<FlyInDirection>,
+) -> Option<AnimationSpec> {
+    let effect = match preset_id {
+        "ooo-exit-disappear" => ExitEffect::Disappear,
+        "ooo-exit-fade-out" => ExitEffect::FadeOut,
+        "ooo-exit-fly-out" => ExitEffect::FlyOut,
+        "ooo-exit-fly-out-slow" => ExitEffect::FlyOutSlow,
+        "ooo-exit-wipe-out" => ExitEffect::WipeOut,
+        "ooo-exit-split" => ExitEffect::Split,
+        "ooo-exit-box" => ExitEffect::Box,
+        "ooo-exit-circle" => ExitEffect::Circle,
+        "ooo-exit-diamond" => ExitEffect::Diamond,
+        "ooo-exit-dissolve-out" => ExitEffect::DissolveOut,
+        "ooo-exit-random-bars" => ExitEffect::RandomBars,
+        "ooo-exit-checkerboard" => ExitEffect::Checkerboard,
+        "ooo-exit-venetian-blinds" => ExitEffect::VenetianBlinds,
+        "ooo-exit-wheel" => ExitEffect::Wheel,
+        "ooo-exit-clock-wipe" => ExitEffect::ClockWipe,
+        "ooo-exit-peek-out" => ExitEffect::PeekOut,
+        "ooo-exit-zoom" => ExitEffect::Zoom,
+        "ooo-exit-fade-out-and-zoom" => ExitEffect::FadeOutAndZoom,
+        "ooo-exit-collapse" => ExitEffect::Collapse,
+        "ooo-exit-compress" => ExitEffect::Compress,
+        "ooo-exit-stretchy" => ExitEffect::Stretchy,
+        "ooo-exit-spin-out" => ExitEffect::SpinOut,
+        "ooo-exit-swivel" => ExitEffect::Swivel,
+        "ooo-exit-sling" => ExitEffect::Sling,
+        "ooo-exit-spiral-out" => ExitEffect::SpiralOut,
+        "ooo-exit-boomerang" => ExitEffect::Boomerang,
+        "ooo-exit-bounce" => ExitEffect::Bounce,
+        "ooo-exit-float" => ExitEffect::Float,
+        "ooo-exit-glide" => ExitEffect::Glide,
+        "ooo-exit-fold" => ExitEffect::Fold,
+        "ooo-exit-thread" => ExitEffect::Thread,
+        "ooo-exit-random" => ExitEffect::Random,
+        _ => return None,
+    };
+    let duration = if effect == ExitEffect::FlyOutSlow {
+        duration.max(5.0)
+    } else {
+        duration
+    };
+    Some(AnimationSpec::exit(effect, direction, duration))
+}
+
 fn apply_pending_animations(
     slide: &mut RichCanvas,
     frame_ids: &HashMap<String, u64>,
@@ -1724,7 +1823,13 @@ fn apply_pending_animations(
                         ..
                     },
                     AnimationKind::Entrance { .. }
-                )
+                        | AnimationKind::Emphasis { .. }
+                        | AnimationKind::Exit { .. }
+                ) | (
+                    AnimationKind::Emphasis { .. },
+                    AnimationKind::Entrance { .. }
+                ) | (AnimationKind::Exit { .. }, AnimationKind::Entrance { .. })
+                    | (AnimationKind::Exit { .. }, AnimationKind::Emphasis { .. })
             )
         });
         if should_replace {
@@ -2081,7 +2186,8 @@ mod tests {
                             duration_seconds,
                             ..
                         } if (duration_seconds - 0.3125).abs() < 0.001
-                    )
+                    ) || matches!(animation.kind, rich_canvas::AnimationKind::Emphasis { .. })
+                        || matches!(animation.kind, rich_canvas::AnimationKind::Exit { .. })
                 })
         }));
         assert!(loaded.slides[1].boxes.iter().any(|render_box| {
@@ -2254,6 +2360,137 @@ mod tests {
                 "preset should be mapped: {preset}"
             );
         }
+    }
+
+    #[test]
+    fn maps_all_documented_emphasis_animation_presets() {
+        let presets = [
+            "ooo-emphasis-spin",
+            "ooo-emphasis-grow-shrink",
+            "ooo-emphasis-pulse",
+            "ooo-emphasis-teeter",
+            "ooo-emphasis-transparency",
+            "ooo-emphasis-fill-color",
+            "ooo-emphasis-line-color",
+            "ooo-emphasis-font-color",
+            "ooo-emphasis-bold-flash",
+            "ooo-emphasis-blink",
+            "ooo-emphasis-color-pulse",
+            "ooo-emphasis-grow-with-color",
+            "ooo-emphasis-lighten",
+            "ooo-emphasis-desaturate",
+            "ooo-emphasis-wave",
+            "ooo-emphasis-flicker",
+            "ooo-emphasis-vertical-highlight",
+            "ooo-emphasis-horizontal-highlight",
+        ];
+
+        for preset in presets {
+            assert!(
+                emphasis_animation_from_preset(preset, 0.5).is_some(),
+                "preset should be mapped: {preset}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_emphasis_animation_from_preset_container() {
+        let animate_xml = r#"
+            <anim:animate smil:dur="0.75s" smil:targetElement="id3"
+                smil:attributeName="width" smil:values="1;1.2;1"/>
+        "#;
+        let mut reader = Reader::from_str(animate_xml);
+        let animate = loop {
+            match reader.read_event().expect("animate XML should parse") {
+                Event::Empty(event) => break event,
+                Event::Eof => panic!("expected anim:animate element"),
+                _ => {}
+            }
+        };
+        let (target, animation) =
+            parse_animate_animation(&animate, reader.decoder(), Some("ooo-emphasis-grow-shrink"))
+                .expect("emphasis animate should import");
+        assert_eq!(target, "id3");
+        assert!(matches!(
+            animation.kind,
+            rich_canvas::AnimationKind::Emphasis {
+                effect: rich_canvas::EmphasisEffect::GrowShrink,
+                duration_seconds
+            } if (duration_seconds - 0.75).abs() < 0.001
+        ));
+    }
+
+    #[test]
+    fn maps_all_documented_exit_animation_presets() {
+        let presets = [
+            "ooo-exit-disappear",
+            "ooo-exit-fade-out",
+            "ooo-exit-fly-out",
+            "ooo-exit-fly-out-slow",
+            "ooo-exit-wipe-out",
+            "ooo-exit-split",
+            "ooo-exit-box",
+            "ooo-exit-circle",
+            "ooo-exit-diamond",
+            "ooo-exit-dissolve-out",
+            "ooo-exit-random-bars",
+            "ooo-exit-checkerboard",
+            "ooo-exit-venetian-blinds",
+            "ooo-exit-wheel",
+            "ooo-exit-clock-wipe",
+            "ooo-exit-peek-out",
+            "ooo-exit-zoom",
+            "ooo-exit-fade-out-and-zoom",
+            "ooo-exit-collapse",
+            "ooo-exit-compress",
+            "ooo-exit-stretchy",
+            "ooo-exit-spin-out",
+            "ooo-exit-swivel",
+            "ooo-exit-sling",
+            "ooo-exit-spiral-out",
+            "ooo-exit-boomerang",
+            "ooo-exit-bounce",
+            "ooo-exit-float",
+            "ooo-exit-glide",
+            "ooo-exit-fold",
+            "ooo-exit-thread",
+            "ooo-exit-random",
+        ];
+
+        for preset in presets {
+            assert!(
+                exit_animation_from_preset(preset, 0.5, Some(rich_canvas::FlyInDirection::FromTop))
+                    .is_some(),
+                "preset should be mapped: {preset}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_exit_visibility_set_animation() {
+        let set_xml = r#"
+            <anim:set smil:dur="0.2s" smil:targetElement="id4"
+                smil:attributeName="visibility" smil:to="hidden"/>
+        "#;
+        let mut reader = Reader::from_str(set_xml);
+        let set = loop {
+            match reader.read_event().expect("set XML should parse") {
+                Event::Empty(event) => break event,
+                Event::Eof => panic!("expected anim:set element"),
+                _ => {}
+            }
+        };
+        let (target, animation) =
+            parse_set_animation(&set, reader.decoder(), None).expect("set should import");
+        assert_eq!(target, "id4");
+        assert!(matches!(
+            animation.kind,
+            rich_canvas::AnimationKind::Exit {
+                effect: rich_canvas::ExitEffect::Disappear,
+                duration_seconds,
+                ..
+            } if (duration_seconds - 0.2).abs() < 0.001
+        ));
     }
 
     #[test]

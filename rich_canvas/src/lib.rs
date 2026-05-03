@@ -2656,6 +2656,15 @@ pub enum AnimationKind {
         direction: Option<FlyInDirection>,
         duration_seconds: f32,
     },
+    Emphasis {
+        effect: EmphasisEffect,
+        duration_seconds: f32,
+    },
+    Exit {
+        effect: ExitEffect,
+        direction: Option<FlyInDirection>,
+        duration_seconds: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2687,6 +2696,64 @@ pub enum EntranceEffect {
     Split,
     Plus,
     Diamond,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmphasisEffect {
+    Spin,
+    GrowShrink,
+    Pulse,
+    Teeter,
+    Transparency,
+    FillColor,
+    LineColor,
+    FontColor,
+    BoldFlash,
+    Blink,
+    ColorPulse,
+    GrowWithColor,
+    Lighten,
+    Desaturate,
+    Wave,
+    Flicker,
+    VerticalHighlight,
+    HorizontalHighlight,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitEffect {
+    Disappear,
+    FadeOut,
+    FlyOut,
+    FlyOutSlow,
+    WipeOut,
+    Split,
+    Box,
+    Circle,
+    Diamond,
+    DissolveOut,
+    RandomBars,
+    Checkerboard,
+    VenetianBlinds,
+    Wheel,
+    ClockWipe,
+    PeekOut,
+    Zoom,
+    FadeOutAndZoom,
+    Collapse,
+    Compress,
+    Stretchy,
+    SpinOut,
+    Swivel,
+    Sling,
+    SpiralOut,
+    Boomerang,
+    Bounce,
+    Float,
+    Glide,
+    Fold,
+    Thread,
+    Random,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2723,6 +2790,33 @@ impl AnimationSpec {
             phase: 0.0,
             amplitude: Vec2::ZERO,
             kind: AnimationKind::Entrance {
+                effect,
+                direction,
+                duration_seconds,
+            },
+        }
+    }
+
+    pub fn emphasis(effect: EmphasisEffect, duration_seconds: f32) -> Self {
+        Self {
+            phase: 0.0,
+            amplitude: Vec2::ZERO,
+            kind: AnimationKind::Emphasis {
+                effect,
+                duration_seconds,
+            },
+        }
+    }
+
+    pub fn exit(
+        effect: ExitEffect,
+        direction: Option<FlyInDirection>,
+        duration_seconds: f32,
+    ) -> Self {
+        Self {
+            phase: 0.0,
+            amplitude: Vec2::ZERO,
+            kind: AnimationKind::Exit {
                 effect,
                 direction,
                 duration_seconds,

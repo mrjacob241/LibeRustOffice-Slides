@@ -4,17 +4,17 @@ mod odp_saver;
 mod pdf_exporter;
 mod slide_screenshot;
 use rich_canvas::{
-    AnimationKind, AnimationSpec, BoxStrokeKind, CanvasMode, CanvasSelection, EntranceEffect,
-    FlyInDirection, ImageResizeHandle, LayoutRole, RenderBox, RenderBoxKind, RichCanvas,
-    TableBlock, TextAlignment, TextRange, TextRun, TextStyle, TextStyleState,
-    TextVerticalAlignment,
+    AnimationKind, AnimationSpec, BoxStrokeKind, CanvasMode, CanvasSelection, EmphasisEffect,
+    EntranceEffect, ExitEffect, FlyInDirection, ImageResizeHandle, LayoutRole, RenderBox,
+    RenderBoxKind, RichCanvas, TableBlock, TextAlignment, TextRange, TextRun, TextStyle,
+    TextStyleState, TextVerticalAlignment,
 };
 use std::{
     fs::OpenOptions,
     io::Write,
     path::Path,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const APP_TITLE: &str = "LibeRustOffice Slides v0.01";
@@ -30,6 +30,98 @@ const MAX_FONT_SIZE_PT: f32 = 144.0;
 const DEFAULT_SAVE_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/sample_docs/saved_slides.odp");
 const RECENT_COLOR_SLOT_COUNT: usize = 10;
+const PRESENTATION_ANIMATION_FPS: f32 = 60.0;
+const PRESENTATION_ANIMATION_FRAME_SECONDS: f32 = 1.0 / PRESENTATION_ANIMATION_FPS;
+const MASK_MIN_SUBDIVISIONS: usize = 24;
+const EMPHASIS_EFFECTS: [EmphasisEffect; 18] = [
+    EmphasisEffect::Spin,
+    EmphasisEffect::GrowShrink,
+    EmphasisEffect::Pulse,
+    EmphasisEffect::Teeter,
+    EmphasisEffect::Transparency,
+    EmphasisEffect::FillColor,
+    EmphasisEffect::LineColor,
+    EmphasisEffect::FontColor,
+    EmphasisEffect::BoldFlash,
+    EmphasisEffect::Blink,
+    EmphasisEffect::ColorPulse,
+    EmphasisEffect::GrowWithColor,
+    EmphasisEffect::Lighten,
+    EmphasisEffect::Desaturate,
+    EmphasisEffect::Wave,
+    EmphasisEffect::Flicker,
+    EmphasisEffect::VerticalHighlight,
+    EmphasisEffect::HorizontalHighlight,
+];
+const EXIT_EFFECTS: [ExitEffect; 32] = [
+    ExitEffect::Disappear,
+    ExitEffect::FadeOut,
+    ExitEffect::FlyOut,
+    ExitEffect::FlyOutSlow,
+    ExitEffect::WipeOut,
+    ExitEffect::Split,
+    ExitEffect::Box,
+    ExitEffect::Circle,
+    ExitEffect::Diamond,
+    ExitEffect::DissolveOut,
+    ExitEffect::RandomBars,
+    ExitEffect::Checkerboard,
+    ExitEffect::VenetianBlinds,
+    ExitEffect::Wheel,
+    ExitEffect::ClockWipe,
+    ExitEffect::PeekOut,
+    ExitEffect::Zoom,
+    ExitEffect::FadeOutAndZoom,
+    ExitEffect::Collapse,
+    ExitEffect::Compress,
+    ExitEffect::Stretchy,
+    ExitEffect::SpinOut,
+    ExitEffect::Swivel,
+    ExitEffect::Sling,
+    ExitEffect::SpiralOut,
+    ExitEffect::Boomerang,
+    ExitEffect::Bounce,
+    ExitEffect::Float,
+    ExitEffect::Glide,
+    ExitEffect::Fold,
+    ExitEffect::Thread,
+    ExitEffect::Random,
+];
+const ENTRANCE_EFFECTS: [EntranceEffect; 27] = [
+    EntranceEffect::Appear,
+    EntranceEffect::VenetianBlinds,
+    EntranceEffect::Box,
+    EntranceEffect::Checkerboard,
+    EntranceEffect::Circle,
+    EntranceEffect::Oval,
+    EntranceEffect::FlyIn,
+    EntranceEffect::FlyInSlow,
+    EntranceEffect::DissolveIn,
+    EntranceEffect::FadeIn,
+    EntranceEffect::FadeInAndZoom,
+    EntranceEffect::Zoom,
+    EntranceEffect::Expand,
+    EntranceEffect::SpinIn,
+    EntranceEffect::Bounce,
+    EntranceEffect::SpiralIn,
+    EntranceEffect::Boomerang,
+    EntranceEffect::Sling,
+    EntranceEffect::Glide,
+    EntranceEffect::Float,
+    EntranceEffect::Magnify,
+    EntranceEffect::Wipe,
+    EntranceEffect::Wheel,
+    EntranceEffect::RandomBars,
+    EntranceEffect::Split,
+    EntranceEffect::Plus,
+    EntranceEffect::Diamond,
+];
+const FLY_IN_DIRECTIONS: [FlyInDirection; 4] = [
+    FlyInDirection::FromLeft,
+    FlyInDirection::FromRight,
+    FlyInDirection::FromTop,
+    FlyInDirection::FromBottom,
+];
 const TEXT_COLOR_PALETTE: [egui::Color32; 10] = [
     egui::Color32::BLACK,
     egui::Color32::RED,
@@ -99,20 +191,42 @@ fn log_loaded_animation_summary(document_name: &str, slides: &[RichCanvas]) {
             let Some(animation) = &render_box.animation else {
                 continue;
             };
-            if let AnimationKind::Entrance {
-                effect,
-                direction,
-                duration_seconds,
-            } = animation.kind
-            {
-                write_animation_telemetry(format!(
-                    "load_effect slide={} box_id={} effect={:?} direction={:?} duration={:.3}",
+            match animation.kind {
+                AnimationKind::Entrance {
+                    effect,
+                    direction,
+                    duration_seconds,
+                } => write_animation_telemetry(format!(
+                    "load_effect slide={} box_id={} kind=entrance effect={:?} direction={:?} duration={:.3}",
                     slide_index + 1,
                     render_box.id,
                     effect,
                     direction,
                     duration_seconds
-                ));
+                )),
+                AnimationKind::Emphasis {
+                    effect,
+                    duration_seconds,
+                } => write_animation_telemetry(format!(
+                    "load_effect slide={} box_id={} kind=emphasis effect={:?} duration={:.3}",
+                    slide_index + 1,
+                    render_box.id,
+                    effect,
+                    duration_seconds
+                )),
+                AnimationKind::Exit {
+                    effect,
+                    direction,
+                    duration_seconds,
+                } => write_animation_telemetry(format!(
+                    "load_effect slide={} box_id={} kind=exit effect={:?} direction={:?} duration={:.3}",
+                    slide_index + 1,
+                    render_box.id,
+                    effect,
+                    direction,
+                    duration_seconds
+                )),
+                AnimationKind::PreviewOscillation => {}
             }
         }
     }
@@ -132,11 +246,44 @@ enum RightPanelTab {
     Scheduler,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PresentationEffect {
+    Entrance {
+        effect: EntranceEffect,
+        direction: Option<FlyInDirection>,
+        duration_seconds: f32,
+    },
+    Emphasis {
+        effect: EmphasisEffect,
+        duration_seconds: f32,
+    },
+    Exit {
+        effect: ExitEffect,
+        direction: Option<FlyInDirection>,
+        duration_seconds: f32,
+    },
+}
+
+impl PresentationEffect {
+    fn duration_seconds(self) -> f32 {
+        match self {
+            PresentationEffect::Entrance {
+                duration_seconds, ..
+            }
+            | PresentationEffect::Emphasis {
+                duration_seconds, ..
+            }
+            | PresentationEffect::Exit {
+                duration_seconds, ..
+            } => duration_seconds,
+        }
+    }
+}
+
 struct LibeRustOfficeSlidesApp {
     canvas: RichCanvas,
     slides: Vec<RichCanvas>,
     active_slide: usize,
-    phase: f32,
     selected_box: Option<u64>,
     caret_index: usize,
     selection_anchor: Option<usize>,
@@ -211,7 +358,6 @@ impl LibeRustOfficeSlidesApp {
             canvas,
             slides,
             active_slide: 0,
-            phase: 0.0,
             selected_box: None,
             caret_index: 0,
             selection_anchor: None,
@@ -279,7 +425,6 @@ impl LibeRustOfficeSlidesApp {
             .first()
             .cloned()
             .expect("ODP loader returned no slides");
-        self.phase = 0.0;
         self.selected_box = None;
         self.caret_index = 0;
         self.selection_anchor = None;
@@ -417,7 +562,12 @@ impl LibeRustOfficeSlidesApp {
             .iter()
             .filter(|render_box| {
                 render_box.animation.as_ref().is_some_and(|animation| {
-                    matches!(animation.kind, AnimationKind::Entrance { .. })
+                    matches!(
+                        animation.kind,
+                        AnimationKind::Entrance { .. }
+                            | AnimationKind::Emphasis { .. }
+                            | AnimationKind::Exit { .. }
+                    )
                 })
             })
             .count()
@@ -516,25 +666,47 @@ impl LibeRustOfficeSlidesApp {
             let Some(animation) = &render_box.animation else {
                 continue;
             };
-            let (effect, duration_seconds, fly_direction) = match animation.kind {
+            let presentation_effect = match animation.kind {
                 AnimationKind::Entrance {
                     effect,
                     direction,
                     duration_seconds,
-                } => (effect, duration_seconds, direction),
+                } => PresentationEffect::Entrance {
+                    effect,
+                    direction,
+                    duration_seconds,
+                },
+                AnimationKind::Emphasis {
+                    effect,
+                    duration_seconds,
+                } => PresentationEffect::Emphasis {
+                    effect,
+                    duration_seconds,
+                },
+                AnimationKind::Exit {
+                    effect,
+                    direction,
+                    duration_seconds,
+                } => PresentationEffect::Exit {
+                    effect,
+                    direction,
+                    duration_seconds,
+                },
                 AnimationKind::PreviewOscillation => continue,
             };
+            let duration_seconds = presentation_effect.duration_seconds();
 
             if effect_index >= self.presentation_revealed_effects {
-                write_animation_telemetry(format!(
-                    "effect_hidden slide={} box_id={} effect_index={} effect={:?} duration={:.3}",
-                    self.active_slide + 1,
-                    render_box.id,
-                    effect_index,
-                    effect,
-                    duration_seconds
-                ));
-                render_box.visible = false;
+                if matches!(presentation_effect, PresentationEffect::Entrance { .. }) {
+                    write_animation_telemetry(format!(
+                        "effect_hidden slide={} box_id={} effect_index={} kind=entrance duration={:.3}",
+                        self.active_slide + 1,
+                        render_box.id,
+                        effect_index,
+                        duration_seconds
+                    ));
+                    render_box.visible = false;
+                }
                 effect_index += 1;
                 continue;
             }
@@ -544,24 +716,66 @@ impl LibeRustOfficeSlidesApp {
                     .presentation_effect_started_at
                     .map(|started| (now - started).max(0.0) as f32)
                     .unwrap_or(duration_seconds);
-                let progress = (elapsed / duration_seconds).clamp(0.0, 1.0);
-                write_animation_telemetry(format!(
-                    "effect_render slide={} box_id={} effect_index={} effect={:?} duration={:.3} elapsed={:.3} progress={:.3}",
-                    self.active_slide + 1,
-                    render_box.id,
-                    effect_index,
-                    effect,
-                    duration_seconds,
-                    elapsed,
-                    progress
-                ));
-                Self::apply_presentation_entrance_effect(
-                    render_box,
-                    effect,
-                    fly_direction,
-                    canvas.page.size,
-                    progress,
-                );
+                let progress = presentation_animation_progress(elapsed, duration_seconds);
+                match presentation_effect {
+                    PresentationEffect::Entrance {
+                        effect, direction, ..
+                    } => {
+                        write_animation_telemetry(format!(
+                            "effect_render slide={} box_id={} effect_index={} kind=entrance effect={:?} duration={:.3} elapsed={:.3} progress={:.3}",
+                            self.active_slide + 1,
+                            render_box.id,
+                            effect_index,
+                            effect,
+                            duration_seconds,
+                            elapsed,
+                            progress
+                        ));
+                        Self::apply_presentation_entrance_effect(
+                            render_box,
+                            effect,
+                            direction,
+                            canvas.page.size,
+                            progress,
+                        );
+                    }
+                    PresentationEffect::Emphasis { effect, .. } => {
+                        write_animation_telemetry(format!(
+                            "effect_render slide={} box_id={} effect_index={} kind=emphasis effect={:?} duration={:.3} elapsed={:.3} progress={:.3}",
+                            self.active_slide + 1,
+                            render_box.id,
+                            effect_index,
+                            effect,
+                            duration_seconds,
+                            elapsed,
+                            progress
+                        ));
+                        Self::apply_presentation_emphasis_effect(render_box, effect, progress);
+                    }
+                    PresentationEffect::Exit {
+                        effect, direction, ..
+                    } => {
+                        write_animation_telemetry(format!(
+                            "effect_render slide={} box_id={} effect_index={} kind=exit effect={:?} duration={:.3} elapsed={:.3} progress={:.3}",
+                            self.active_slide + 1,
+                            render_box.id,
+                            effect_index,
+                            effect,
+                            duration_seconds,
+                            elapsed,
+                            progress
+                        ));
+                        Self::apply_presentation_exit_effect(
+                            render_box,
+                            effect,
+                            direction,
+                            canvas.page.size,
+                            progress,
+                        );
+                    }
+                }
+            } else if matches!(presentation_effect, PresentationEffect::Exit { .. }) {
+                render_box.visible = false;
             }
 
             effect_index += 1;
@@ -702,6 +916,238 @@ impl LibeRustOfficeSlidesApp {
         }
     }
 
+    fn apply_presentation_emphasis_effect(
+        render_box: &mut RenderBox,
+        effect: EmphasisEffect,
+        progress: f32,
+    ) {
+        let progress = progress.clamp(0.0, 1.0);
+        let pulse = (progress * std::f32::consts::TAU).sin().abs();
+        let signed_wave = (progress * std::f32::consts::TAU).sin();
+
+        match effect {
+            EmphasisEffect::Spin => {
+                render_box.rotation += progress * 360.0;
+            }
+            EmphasisEffect::GrowShrink => {
+                apply_centered_scale(render_box, 1.0 + 0.18 * pulse);
+            }
+            EmphasisEffect::Pulse => {
+                apply_centered_scale(render_box, 1.0 + 0.12 * pulse);
+            }
+            EmphasisEffect::Teeter => {
+                render_box.rotation += signed_wave * 8.0;
+            }
+            EmphasisEffect::Transparency => {
+                apply_image_opacity(render_box, 1.0 - 0.55 * pulse);
+            }
+            EmphasisEffect::FillColor => {
+                render_box.style.fill = mix_color(
+                    render_box.style.fill,
+                    egui::Color32::from_rgb(255, 220, 64),
+                    pulse,
+                );
+            }
+            EmphasisEffect::LineColor => {
+                render_box.style.stroke = mix_color(
+                    render_box.style.stroke,
+                    egui::Color32::from_rgb(220, 48, 48),
+                    pulse,
+                );
+            }
+            EmphasisEffect::FontColor => {
+                apply_text_color_pulse(render_box, egui::Color32::from_rgb(220, 48, 48), pulse);
+            }
+            EmphasisEffect::BoldFlash => {
+                if progress < 0.5 {
+                    apply_text_bold(render_box, true);
+                }
+            }
+            EmphasisEffect::Blink => {
+                render_box.visible = (progress * 8.0).floor() as i32 % 2 == 0;
+            }
+            EmphasisEffect::ColorPulse => {
+                apply_text_color_pulse(render_box, egui::Color32::from_rgb(0, 140, 220), pulse);
+                render_box.style.fill = mix_color(
+                    render_box.style.fill,
+                    egui::Color32::from_rgb(0, 140, 220),
+                    pulse,
+                );
+            }
+            EmphasisEffect::GrowWithColor => {
+                apply_centered_scale(render_box, 1.0 + 0.14 * pulse);
+                render_box.style.fill = mix_color(
+                    render_box.style.fill,
+                    egui::Color32::from_rgb(255, 210, 64),
+                    pulse,
+                );
+                apply_text_color_pulse(render_box, egui::Color32::from_rgb(255, 210, 64), pulse);
+            }
+            EmphasisEffect::Lighten => {
+                render_box.style.fill =
+                    mix_color(render_box.style.fill, egui::Color32::WHITE, pulse * 0.55);
+                apply_text_color_pulse(render_box, egui::Color32::WHITE, pulse * 0.35);
+            }
+            EmphasisEffect::Desaturate => {
+                render_box.style.fill = desaturate_color(render_box.style.fill, pulse * 0.85);
+                render_box.style.stroke = desaturate_color(render_box.style.stroke, pulse * 0.85);
+                desaturate_text(render_box, pulse * 0.85);
+            }
+            EmphasisEffect::Wave => {
+                render_box.position += egui::vec2(progress * 28.0, signed_wave * 10.0);
+            }
+            EmphasisEffect::Flicker => {
+                let step = (progress * 14.0).floor() as usize;
+                render_box.visible = !matches!(step, 1 | 2 | 5 | 8 | 11);
+            }
+            EmphasisEffect::VerticalHighlight => {
+                render_box.position += egui::vec2(0.0, -signed_wave.abs() * 18.0);
+                render_box.style.fill = mix_color(
+                    render_box.style.fill,
+                    egui::Color32::from_rgb(255, 242, 0),
+                    pulse,
+                );
+            }
+            EmphasisEffect::HorizontalHighlight => {
+                render_box.position += egui::vec2(signed_wave * 18.0, 0.0);
+                render_box.style.fill = mix_color(
+                    render_box.style.fill,
+                    egui::Color32::from_rgb(255, 242, 0),
+                    pulse,
+                );
+            }
+        }
+    }
+
+    fn apply_presentation_exit_effect(
+        render_box: &mut RenderBox,
+        effect: ExitEffect,
+        direction: Option<FlyInDirection>,
+        page_size: egui::Vec2,
+        progress: f32,
+    ) {
+        let progress = progress.clamp(0.0, 1.0);
+        let eased = ease_out(progress);
+        if progress >= 1.0 || matches!(effect, ExitEffect::Disappear) {
+            render_box.visible = false;
+            return;
+        }
+
+        match effect {
+            ExitEffect::Disappear => {}
+            ExitEffect::FadeOut => {
+                apply_image_opacity(render_box, 1.0 - eased);
+            }
+            ExitEffect::DissolveOut => {
+                apply_image_reveal_mask(render_box, EntranceEffect::DissolveIn, 1.0 - eased);
+            }
+            ExitEffect::FlyOut | ExitEffect::FlyOutSlow => {
+                let direction = direction.unwrap_or(FlyInDirection::FromRight);
+                let offset = Self::presentation_fly_in_offset(
+                    direction,
+                    page_size,
+                    render_box.position,
+                    render_box.size,
+                );
+                render_box.position += offset * eased;
+            }
+            ExitEffect::Bounce => {
+                let offset = Self::presentation_fly_in_offset(
+                    FlyInDirection::FromBottom,
+                    page_size,
+                    render_box.position,
+                    render_box.size,
+                );
+                let bounce =
+                    (progress * std::f32::consts::PI * 3.0).sin().abs() * (1.0 - progress) * 28.0;
+                render_box.position += offset * eased + egui::vec2(0.0, -bounce);
+            }
+            ExitEffect::Float | ExitEffect::Glide | ExitEffect::PeekOut => {
+                let offset = Self::presentation_fly_in_offset(
+                    direction.unwrap_or(FlyInDirection::FromBottom),
+                    page_size,
+                    render_box.position,
+                    render_box.size,
+                ) * 0.45;
+                render_box.position += offset * eased;
+                if matches!(effect, ExitEffect::Float) {
+                    apply_image_opacity(render_box, 1.0 - eased);
+                }
+            }
+            ExitEffect::SpiralOut => {
+                let radius = 180.0 * eased;
+                let angle = progress * std::f32::consts::TAU * 1.5;
+                render_box.position += egui::vec2(angle.cos() * radius, angle.sin() * radius);
+                apply_centered_scale(render_box, 1.0 - 0.75 * eased);
+            }
+            ExitEffect::Boomerang | ExitEffect::Sling => {
+                let offset = Self::presentation_fly_in_offset(
+                    FlyInDirection::FromRight,
+                    page_size,
+                    render_box.position,
+                    render_box.size,
+                ) * 0.5;
+                render_box.position += offset * eased;
+                render_box.rotation += eased * 180.0;
+            }
+            ExitEffect::SpinOut => {
+                render_box.rotation += eased * 360.0;
+                apply_centered_scale(render_box, 1.0 - 0.95 * eased);
+            }
+            ExitEffect::Zoom
+            | ExitEffect::Collapse
+            | ExitEffect::Compress
+            | ExitEffect::Swivel
+            | ExitEffect::Fold
+            | ExitEffect::Thread => {
+                let scale = 1.0 - 0.95 * eased;
+                apply_centered_scale(render_box, scale);
+                if matches!(effect, ExitEffect::Swivel) {
+                    render_box.rotation += eased * 80.0;
+                }
+            }
+            ExitEffect::Stretchy => {
+                render_box.scale.x *= 1.0 + eased * 0.5;
+                render_box.scale.y *= (1.0 - 0.95 * eased).max(0.01);
+            }
+            ExitEffect::FadeOutAndZoom => {
+                apply_image_opacity(render_box, 1.0 - eased);
+                apply_centered_scale(render_box, 1.0 - 0.85 * eased);
+            }
+            ExitEffect::WipeOut
+            | ExitEffect::Split
+            | ExitEffect::Box
+            | ExitEffect::Circle
+            | ExitEffect::Diamond
+            | ExitEffect::RandomBars
+            | ExitEffect::Checkerboard
+            | ExitEffect::VenetianBlinds
+            | ExitEffect::Wheel
+            | ExitEffect::ClockWipe => {
+                let entrance_mask = match effect {
+                    ExitEffect::WipeOut => EntranceEffect::Wipe,
+                    ExitEffect::Split => EntranceEffect::Split,
+                    ExitEffect::Box => EntranceEffect::Box,
+                    ExitEffect::Circle => EntranceEffect::Circle,
+                    ExitEffect::Diamond => EntranceEffect::Diamond,
+                    ExitEffect::RandomBars => EntranceEffect::RandomBars,
+                    ExitEffect::Checkerboard => EntranceEffect::Checkerboard,
+                    ExitEffect::VenetianBlinds => EntranceEffect::VenetianBlinds,
+                    ExitEffect::Wheel | ExitEffect::ClockWipe => EntranceEffect::Wheel,
+                    _ => EntranceEffect::Wipe,
+                };
+                if !apply_image_reveal_mask(render_box, entrance_mask, 1.0 - eased) {
+                    apply_centered_scale(render_box, (1.0 - eased).max(0.05));
+                }
+            }
+            ExitEffect::Random => {
+                render_box.rotation += eased * 180.0;
+                apply_image_opacity(render_box, 1.0 - eased);
+                apply_centered_scale(render_box, 1.0 - 0.8 * eased);
+            }
+        }
+    }
+
     fn apply_pending_fit_zoom(&mut self, viewport_size: egui::Vec2) {
         if !self.fit_zoom_pending || viewport_size.x <= 0.0 || viewport_size.y <= 0.0 {
             return;
@@ -721,18 +1167,6 @@ impl LibeRustOfficeSlidesApp {
             slide.zoom = fit_zoom;
         }
         self.fit_zoom_pending = false;
-    }
-
-    fn advance_animation_phase(&mut self) {
-        self.phase += 0.03;
-
-        for render_box in &mut self.canvas.boxes {
-            if let Some(animation) = &mut render_box.animation {
-                animation.phase = self.phase;
-            }
-        }
-
-        self.canvas.relayout(CanvasMode::SlideDeck);
     }
 
     fn draw_file_menu(&mut self, ui: &mut egui::Ui) {
@@ -1555,6 +1989,7 @@ impl LibeRustOfficeSlidesApp {
     fn draw_animation_panel(&mut self, ui: &mut egui::Ui) {
         let Some(selected_id) = self.selected_box else {
             ui.label("No object selected");
+            ui.label("Select an object to edit its animation.");
             return;
         };
 
@@ -1566,36 +2001,168 @@ impl LibeRustOfficeSlidesApp {
         if render_box
             .animation
             .as_ref()
-            .is_some_and(|animation| matches!(animation.kind, AnimationKind::Entrance { .. }))
+            .is_some_and(|animation| matches!(animation.kind, AnimationKind::PreviewOscillation))
         {
-            ui.label("Imported presentation animation");
-            return;
+            render_box.animation = None;
         }
 
-        let mut enabled = render_box
+        ui.label(format!("Selected object #{selected_id}"));
+        ui.separator();
+
+        let mut mode = match render_box
             .animation
             .as_ref()
-            .is_some_and(|animation| animation.is_preview_oscillation());
-        if ui.checkbox(&mut enabled, "Preview animation").changed() {
-            render_box.animation = enabled.then_some(AnimationSpec::preview_oscillation(
-                self.phase,
-                egui::vec2(6.0, 0.0),
-            ));
+            .map(|animation| &animation.kind)
+        {
+            Some(AnimationKind::Entrance { .. }) => 2,
+            Some(AnimationKind::Emphasis { .. }) => 3,
+            Some(AnimationKind::Exit { .. }) => 4,
+            Some(AnimationKind::PreviewOscillation) | None => 0,
+        };
+        let previous_mode = mode;
+        ui.label("Mode");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut mode, 0, "None");
+            ui.selectable_value(&mut mode, 2, "Entrance");
+            ui.selectable_value(&mut mode, 3, "Emphasis");
+            ui.selectable_value(&mut mode, 4, "Exit");
+        });
+
+        if mode != previous_mode {
+            render_box.animation = match mode {
+                2 => Some(AnimationSpec::entrance(EntranceEffect::FadeIn, None, 0.6)),
+                3 => Some(AnimationSpec::emphasis(EmphasisEffect::Pulse, 0.6)),
+                4 => Some(AnimationSpec::exit(ExitEffect::FadeOut, None, 0.6)),
+                _ => None,
+            };
             self.status = format!("Updated animation for object #{selected_id}");
         }
 
-        if let Some(animation) = &mut render_box.animation
-            && animation.is_preview_oscillation()
-        {
-            ui.separator();
-            let mut changed = false;
-            changed |=
-                draw_f32_drag_field(ui, "Amplitude X", &mut animation.amplitude.x, -80.0, 80.0);
-            changed |=
-                draw_f32_drag_field(ui, "Amplitude Y", &mut animation.amplitude.y, -80.0, 80.0);
-            if changed {
-                self.status = format!("Updated animation for object #{selected_id}");
+        match render_box.animation.as_mut() {
+            Some(AnimationSpec {
+                kind:
+                    AnimationKind::Entrance {
+                        effect,
+                        direction,
+                        duration_seconds,
+                    },
+                ..
+            }) => {
+                ui.separator();
+                ui.label("Entrance effect");
+
+                let mut changed = false;
+                egui::ComboBox::from_label("Effect")
+                    .selected_text(entrance_effect_label(*effect))
+                    .show_ui(ui, |ui| {
+                        for option in ENTRANCE_EFFECTS {
+                            changed |= ui
+                                .selectable_value(effect, option, entrance_effect_label(option))
+                                .changed();
+                        }
+                    });
+
+                egui::ComboBox::from_label("Direction")
+                    .selected_text(direction.map(fly_in_direction_label).unwrap_or("Default"))
+                    .show_ui(ui, |ui| {
+                        changed |= ui.selectable_value(direction, None, "Default").changed();
+                        for option in FLY_IN_DIRECTIONS {
+                            changed |= ui
+                                .selectable_value(
+                                    direction,
+                                    Some(option),
+                                    fly_in_direction_label(option),
+                                )
+                                .changed();
+                        }
+                    });
+
+                changed |= draw_f32_drag_field(ui, "Duration", duration_seconds, 0.0, 30.0);
+                *duration_seconds = duration_seconds.max(0.0);
+
+                if changed {
+                    self.status = format!("Updated animation for object #{selected_id}");
+                }
             }
+            Some(AnimationSpec {
+                kind:
+                    AnimationKind::Emphasis {
+                        effect,
+                        duration_seconds,
+                    },
+                ..
+            }) => {
+                ui.separator();
+                ui.label("Emphasis effect");
+
+                let mut changed = false;
+                egui::ComboBox::from_label("Effect")
+                    .selected_text(emphasis_effect_label(*effect))
+                    .show_ui(ui, |ui| {
+                        for option in EMPHASIS_EFFECTS {
+                            changed |= ui
+                                .selectable_value(effect, option, emphasis_effect_label(option))
+                                .changed();
+                        }
+                    });
+
+                changed |= draw_f32_drag_field(ui, "Duration", duration_seconds, 0.0, 30.0);
+                *duration_seconds = duration_seconds.max(0.0);
+
+                if changed {
+                    self.status = format!("Updated animation for object #{selected_id}");
+                }
+            }
+            Some(AnimationSpec {
+                kind:
+                    AnimationKind::Exit {
+                        effect,
+                        direction,
+                        duration_seconds,
+                    },
+                ..
+            }) => {
+                ui.separator();
+                ui.label("Exit effect");
+
+                let mut changed = false;
+                egui::ComboBox::from_label("Effect")
+                    .selected_text(exit_effect_label(*effect))
+                    .show_ui(ui, |ui| {
+                        for option in EXIT_EFFECTS {
+                            changed |= ui
+                                .selectable_value(effect, option, exit_effect_label(option))
+                                .changed();
+                        }
+                    });
+
+                egui::ComboBox::from_label("Direction")
+                    .selected_text(direction.map(fly_in_direction_label).unwrap_or("Default"))
+                    .show_ui(ui, |ui| {
+                        changed |= ui.selectable_value(direction, None, "Default").changed();
+                        for option in FLY_IN_DIRECTIONS {
+                            changed |= ui
+                                .selectable_value(
+                                    direction,
+                                    Some(option),
+                                    fly_in_direction_label(option),
+                                )
+                                .changed();
+                        }
+                    });
+
+                changed |= draw_f32_drag_field(ui, "Duration", duration_seconds, 0.0, 30.0);
+                *duration_seconds = duration_seconds.max(0.0);
+
+                if changed {
+                    self.status = format!("Updated animation for object #{selected_id}");
+                }
+            }
+            None => {
+                ui.separator();
+                ui.label("No animation assigned");
+            }
+            _ => {}
         }
     }
 
@@ -2256,8 +2823,9 @@ impl LibeRustOfficeSlidesApp {
 impl App for LibeRustOfficeSlidesApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
-        self.advance_animation_phase();
-        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_secs_f32(
+            PRESENTATION_ANIMATION_FRAME_SECONDS,
+        ));
 
         if self.presentation_mode {
             self.draw_presentation_mode(ctx);
@@ -2410,6 +2978,107 @@ fn draw_f32_drag_field(
         changed = response.changed();
     });
     changed
+}
+
+fn entrance_effect_label(effect: EntranceEffect) -> &'static str {
+    match effect {
+        EntranceEffect::Appear => "Appear",
+        EntranceEffect::VenetianBlinds => "Venetian Blinds",
+        EntranceEffect::Box => "Box",
+        EntranceEffect::Checkerboard => "Checkerboard",
+        EntranceEffect::Circle => "Circle",
+        EntranceEffect::Oval => "Oval",
+        EntranceEffect::FlyIn => "Fly In",
+        EntranceEffect::FlyInSlow => "Fly In Slow",
+        EntranceEffect::DissolveIn => "Dissolve In",
+        EntranceEffect::FadeIn => "Fade In",
+        EntranceEffect::FadeInAndZoom => "Fade In and Zoom",
+        EntranceEffect::Zoom => "Zoom",
+        EntranceEffect::Expand => "Expand",
+        EntranceEffect::SpinIn => "Spin In",
+        EntranceEffect::Bounce => "Bounce",
+        EntranceEffect::SpiralIn => "Spiral In",
+        EntranceEffect::Boomerang => "Boomerang",
+        EntranceEffect::Sling => "Sling",
+        EntranceEffect::Glide => "Glide",
+        EntranceEffect::Float => "Float",
+        EntranceEffect::Magnify => "Magnify",
+        EntranceEffect::Wipe => "Wipe",
+        EntranceEffect::Wheel => "Wheel",
+        EntranceEffect::RandomBars => "Random Bars",
+        EntranceEffect::Split => "Split",
+        EntranceEffect::Plus => "Plus",
+        EntranceEffect::Diamond => "Diamond",
+    }
+}
+
+fn emphasis_effect_label(effect: EmphasisEffect) -> &'static str {
+    match effect {
+        EmphasisEffect::Spin => "Spin",
+        EmphasisEffect::GrowShrink => "Grow/Shrink",
+        EmphasisEffect::Pulse => "Pulse",
+        EmphasisEffect::Teeter => "Teeter",
+        EmphasisEffect::Transparency => "Transparency",
+        EmphasisEffect::FillColor => "Change Fill Color",
+        EmphasisEffect::LineColor => "Change Line Color",
+        EmphasisEffect::FontColor => "Change Font Color",
+        EmphasisEffect::BoldFlash => "Bold Flash",
+        EmphasisEffect::Blink => "Blink",
+        EmphasisEffect::ColorPulse => "Color Pulse",
+        EmphasisEffect::GrowWithColor => "Grow with Color",
+        EmphasisEffect::Lighten => "Lighten/Darken",
+        EmphasisEffect::Desaturate => "Desaturate",
+        EmphasisEffect::Wave => "Wave",
+        EmphasisEffect::Flicker => "Flicker",
+        EmphasisEffect::VerticalHighlight => "Vertical Highlight",
+        EmphasisEffect::HorizontalHighlight => "Horizontal Highlight",
+    }
+}
+
+fn exit_effect_label(effect: ExitEffect) -> &'static str {
+    match effect {
+        ExitEffect::Disappear => "Disappear",
+        ExitEffect::FadeOut => "Fade Out",
+        ExitEffect::FlyOut => "Fly Out",
+        ExitEffect::FlyOutSlow => "Fly Out Slow",
+        ExitEffect::WipeOut => "Wipe Out",
+        ExitEffect::Split => "Split",
+        ExitEffect::Box => "Box",
+        ExitEffect::Circle => "Circle",
+        ExitEffect::Diamond => "Diamond",
+        ExitEffect::DissolveOut => "Dissolve Out",
+        ExitEffect::RandomBars => "Random Bars",
+        ExitEffect::Checkerboard => "Checkerboard",
+        ExitEffect::VenetianBlinds => "Venetian Blinds",
+        ExitEffect::Wheel => "Wheel",
+        ExitEffect::ClockWipe => "Clock Wipe",
+        ExitEffect::PeekOut => "Peek Out",
+        ExitEffect::Zoom => "Zoom",
+        ExitEffect::FadeOutAndZoom => "Fade Out and Zoom",
+        ExitEffect::Collapse => "Collapse",
+        ExitEffect::Compress => "Compress",
+        ExitEffect::Stretchy => "Stretchy",
+        ExitEffect::SpinOut => "Spin Out",
+        ExitEffect::Swivel => "Swivel",
+        ExitEffect::Sling => "Sling",
+        ExitEffect::SpiralOut => "Spiral Out",
+        ExitEffect::Boomerang => "Boomerang",
+        ExitEffect::Bounce => "Bounce",
+        ExitEffect::Float => "Float",
+        ExitEffect::Glide => "Glide",
+        ExitEffect::Fold => "Fold",
+        ExitEffect::Thread => "Thread",
+        ExitEffect::Random => "Random",
+    }
+}
+
+fn fly_in_direction_label(direction: FlyInDirection) -> &'static str {
+    match direction {
+        FlyInDirection::FromLeft => "From left",
+        FlyInDirection::FromRight => "From right",
+        FlyInDirection::FromTop => "From top",
+        FlyInDirection::FromBottom => "From bottom",
+    }
 }
 
 fn rotate_vec(vector: egui::Vec2, rotation_degrees: f32) -> egui::Vec2 {
@@ -2648,8 +3317,17 @@ fn ease_out(progress: f32) -> f32 {
     1.0 - (1.0 - progress).powi(3)
 }
 
+fn presentation_animation_progress(elapsed_seconds: f32, duration_seconds: f32) -> f32 {
+    if duration_seconds <= 0.0 {
+        return 1.0;
+    }
+    let frame = (elapsed_seconds / PRESENTATION_ANIMATION_FRAME_SECONDS).floor();
+    let sampled_elapsed = frame * PRESENTATION_ANIMATION_FRAME_SECONDS;
+    (sampled_elapsed / duration_seconds).clamp(0.0, 1.0)
+}
+
 fn apply_centered_scale(render_box: &mut RenderBox, scale: f32) {
-    let scale = scale.clamp(0.01, 1.0);
+    let scale = scale.clamp(0.01, 4.0);
     let original_visual_size = egui::vec2(
         render_box.size.x * render_box.scale.x,
         render_box.size.y * render_box.scale.y,
@@ -2660,6 +3338,62 @@ fn apply_centered_scale(render_box: &mut RenderBox, scale: f32) {
         render_box.size.y * render_box.scale.y,
     );
     render_box.position += (original_visual_size - next_visual_size) * 0.5;
+}
+
+fn mix_color(from: egui::Color32, to: egui::Color32, amount: f32) -> egui::Color32 {
+    if from == egui::Color32::TRANSPARENT {
+        return from;
+    }
+    let amount = amount.clamp(0.0, 1.0);
+    egui::Color32::from_rgba_unmultiplied(
+        lerp_u8(from.r(), to.r(), amount),
+        lerp_u8(from.g(), to.g(), amount),
+        lerp_u8(from.b(), to.b(), amount),
+        from.a(),
+    )
+}
+
+fn lerp_u8(from: u8, to: u8, amount: f32) -> u8 {
+    (from as f32 + (to as f32 - from as f32) * amount)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+fn desaturate_color(color: egui::Color32, amount: f32) -> egui::Color32 {
+    if color == egui::Color32::TRANSPARENT {
+        return color;
+    }
+    let gray = (color.r() as f32 * 0.299 + color.g() as f32 * 0.587 + color.b() as f32 * 0.114)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    mix_color(color, egui::Color32::from_rgb(gray, gray, gray), amount)
+}
+
+fn apply_text_color_pulse(render_box: &mut RenderBox, color: egui::Color32, amount: f32) {
+    let RenderBoxKind::Text(text) = &mut render_box.kind else {
+        return;
+    };
+    for run in &mut text.runs {
+        run.style.color = mix_color(run.style.color, color, amount);
+    }
+}
+
+fn desaturate_text(render_box: &mut RenderBox, amount: f32) {
+    let RenderBoxKind::Text(text) = &mut render_box.kind else {
+        return;
+    };
+    for run in &mut text.runs {
+        run.style.color = desaturate_color(run.style.color, amount);
+    }
+}
+
+fn apply_text_bold(render_box: &mut RenderBox, bold: bool) {
+    let RenderBoxKind::Text(text) = &mut render_box.kind else {
+        return;
+    };
+    for run in &mut text.runs {
+        run.style.bold = bold;
+    }
 }
 
 fn apply_image_opacity(render_box: &mut RenderBox, opacity: f32) -> bool {
@@ -2690,22 +3424,37 @@ fn apply_image_reveal_mask(
     }
 
     let progress = progress.clamp(0.0, 1.0);
-    let threshold = (progress * 2.0).clamp(0.0, 2.0);
+    if progress >= 1.0 {
+        image.invalidate_texture();
+        write_animation_telemetry(format!(
+            "mask_render box_id={} effect={:?} progress={:.3} image={}x{} kept_pixels={} hidden_pixels=0",
+            render_box.id,
+            effect,
+            progress,
+            width,
+            height,
+            width * height
+        ));
+        return true;
+    }
+
+    let diamond_threshold = (progress * 2.0).clamp(0.0, 2.0);
+    let circle_threshold = progress * std::f32::consts::SQRT_2;
+    let oval_threshold = progress * (1.0_f32 + 0.65).sqrt();
     let horizontal_limit = (width as f32 * progress).round() as usize;
     let center_x = (width.saturating_sub(1)) as f32 * 0.5;
     let center_y = (height.saturating_sub(1)) as f32 * 0.5;
     let half_w = center_x.max(1.0);
     let half_h = center_y.max(1.0);
-    let checker_step = ((width.min(height) as f32) / 10.0).round().max(4.0) as usize;
-    let bar_count = 12usize;
-    let wheel_segments = 8usize;
+    let short_edge = width.min(height).max(1);
+    let checker_step = (short_edge / MASK_MIN_SUBDIVISIONS).max(4);
+    let bar_count = (height / checker_step).max(MASK_MIN_SUBDIVISIONS);
+    let wheel_segments = 24usize;
     let mut kept_pixels = 0usize;
     let mut hidden_pixels = 0usize;
 
-    if progress < 1.0 {
-        render_box.style.fill = egui::Color32::TRANSPARENT;
-        render_box.style.stroke = egui::Color32::TRANSPARENT;
-    }
+    render_box.style.fill = egui::Color32::TRANSPARENT;
+    render_box.style.stroke = egui::Color32::TRANSPARENT;
 
     for y in 0..height {
         for x in 0..width {
@@ -2714,9 +3463,9 @@ fn apply_image_reveal_mask(
             let dx = x as f32 - center_x;
             let dy = y as f32 - center_y;
             let keep = match effect {
-                EntranceEffect::Diamond => nx + ny <= threshold,
-                EntranceEffect::Circle => (nx * nx + ny * ny).sqrt() <= progress,
-                EntranceEffect::Oval => (nx * nx * 0.65 + ny * ny).sqrt() <= progress,
+                EntranceEffect::Diamond => nx + ny <= diamond_threshold,
+                EntranceEffect::Circle => (nx * nx + ny * ny).sqrt() <= circle_threshold,
+                EntranceEffect::Oval => (nx * nx * 0.65 + ny * ny).sqrt() <= oval_threshold,
                 EntranceEffect::Box => nx <= progress && ny <= progress,
                 EntranceEffect::Wipe => x < horizontal_limit,
                 EntranceEffect::Split => nx <= progress,
@@ -2735,7 +3484,8 @@ fn apply_image_reveal_mask(
                     let segment =
                         ((angle / std::f32::consts::TAU) * wheel_segments as f32).floor() as usize;
                     let radius = (nx * nx + ny * ny).sqrt();
-                    segment as f32 / wheel_segments as f32 <= progress && radius <= threshold
+                    segment as f32 / wheel_segments as f32 <= progress
+                        && radius <= diamond_threshold
                 }
                 EntranceEffect::VenetianBlinds => {
                     let stripe = y / checker_step;
@@ -2747,13 +3497,12 @@ fn apply_image_reveal_mask(
                 EntranceEffect::Checkerboard => {
                     let cell_x = x / checker_step;
                     let cell_y = y / checker_step;
-                    let phase = (progress * 2.0).floor() as usize;
-                    ((cell_x + cell_y + phase) % 2 == 0 && progress > 0.15) || progress > 0.65
+                    let order = checkerboard_cell_order(cell_x, cell_y);
+                    order <= progress
                 }
                 EntranceEffect::RandomBars => {
                     let bar = (y * bar_count / height).min(bar_count - 1);
-                    let pseudo = ((bar * 37 + 11) % bar_count) as f32 / bar_count as f32;
-                    pseudo <= progress
+                    random_bar_order(bar, bar_count) <= progress
                 }
                 _ => return false,
             };
@@ -2776,6 +3525,22 @@ fn apply_image_reveal_mask(
         render_box.id, effect, progress, width, height, kept_pixels, hidden_pixels
     ));
     true
+}
+
+fn checkerboard_cell_order(cell_x: usize, cell_y: usize) -> f32 {
+    let value = cell_x
+        .wrapping_mul(73_856_093)
+        .wrapping_add(cell_y.wrapping_mul(19_349_663))
+        .wrapping_add((cell_x + cell_y) & 1);
+    (value & 1023) as f32 / 1023.0
+}
+
+fn random_bar_order(bar: usize, bar_count: usize) -> f32 {
+    if bar_count <= 1 {
+        return 0.0;
+    }
+    let value = bar.wrapping_mul(37).wrapping_add(11) % bar_count;
+    value as f32 / (bar_count - 1) as f32
 }
 
 fn configure_local_editor_fonts(ctx: &egui::Context) {

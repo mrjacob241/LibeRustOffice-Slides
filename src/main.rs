@@ -4,11 +4,18 @@ mod odp_saver;
 mod pdf_exporter;
 mod slide_screenshot;
 use rich_canvas::{
-    AnimationSpec, BoxStrokeKind, CanvasMode, CanvasSelection, ImageResizeHandle, LayoutRole,
-    RenderBox, RenderBoxKind, RichCanvas, TableBlock, TextAlignment, TextRange, TextRun, TextStyle,
-    TextStyleState, TextVerticalAlignment,
+    AnimationKind, AnimationSpec, BoxStrokeKind, CanvasMode, CanvasSelection, EntranceEffect,
+    FlyInDirection, ImageResizeHandle, LayoutRole, RenderBox, RenderBoxKind, RichCanvas,
+    TableBlock, TextAlignment, TextRange, TextRun, TextStyle, TextStyleState,
+    TextVerticalAlignment,
 };
-use std::{path::Path, sync::Arc};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::Path,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const APP_TITLE: &str = "LibeRustOffice Slides v0.01";
 const SIDE_PANEL_MIN_WIDTH: f32 = 180.0;
@@ -47,6 +54,69 @@ const HIGHLIGHT_COLOR_PALETTE: [Option<egui::Color32>; 10] = [
     Some(egui::Color32::from_rgb(235, 235, 160)),
     Some(egui::Color32::from_rgb(210, 210, 210)),
 ];
+const ANIMATION_TELEMETRY_ENABLED: bool = false;
+
+fn write_animation_telemetry(line: impl AsRef<str>) {
+    if !ANIMATION_TELEMETRY_ENABLED {
+        return;
+    }
+
+    let line = format!(
+        "animation_event ts_ms={} {}",
+        animation_telemetry_timestamp_ms(),
+        line.as_ref()
+    );
+    eprintln!("{line}");
+
+    if std::fs::create_dir_all("logs").is_err() {
+        return;
+    }
+
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("logs/animation_telemetry.log")
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn animation_telemetry_timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn log_loaded_animation_summary(document_name: &str, slides: &[RichCanvas]) {
+    write_animation_telemetry(format!(
+        "load_summary document={:?} slides={}",
+        document_name,
+        slides.len()
+    ));
+    for (slide_index, slide) in slides.iter().enumerate() {
+        for render_box in &slide.boxes {
+            let Some(animation) = &render_box.animation else {
+                continue;
+            };
+            if let AnimationKind::Entrance {
+                effect,
+                direction,
+                duration_seconds,
+            } = animation.kind
+            {
+                write_animation_telemetry(format!(
+                    "load_effect slide={} box_id={} effect={:?} direction={:?} duration={:.3}",
+                    slide_index + 1,
+                    render_box.id,
+                    effect,
+                    direction,
+                    duration_seconds
+                ));
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LeftPanelTab {
@@ -84,6 +154,9 @@ struct LibeRustOfficeSlidesApp {
     recent_text_custom_colors: [Option<egui::Color32>; RECENT_COLOR_SLOT_COUNT],
     recent_highlight_custom_colors: [Option<egui::Color32>; RECENT_COLOR_SLOT_COUNT],
     fit_zoom_pending: bool,
+    presentation_mode: bool,
+    presentation_revealed_effects: usize,
+    presentation_effect_started_at: Option<f64>,
     status: String,
     next_box_id: u64,
 }
@@ -122,6 +195,7 @@ impl LibeRustOfficeSlidesApp {
         });
         let slides = loaded.slides;
         let document_name = loaded.document_name;
+        log_loaded_animation_summary(&document_name, &slides);
         let status = format!("Loaded default ODP {}", odp_loader::DEFAULT_ODP_PATH);
         let canvas = slides
             .first()
@@ -155,6 +229,9 @@ impl LibeRustOfficeSlidesApp {
             recent_text_custom_colors: [None; RECENT_COLOR_SLOT_COUNT],
             recent_highlight_custom_colors: [None; RECENT_COLOR_SLOT_COUNT],
             fit_zoom_pending: true,
+            presentation_mode: false,
+            presentation_revealed_effects: 0,
+            presentation_effect_started_at: None,
             status,
             next_box_id,
         }
@@ -195,6 +272,7 @@ impl LibeRustOfficeSlidesApp {
 
     fn apply_loaded_odp(&mut self, loaded: odp_loader::LoadedOdp) {
         self.slides = loaded.slides;
+        log_loaded_animation_summary(&loaded.document_name, &self.slides);
         self.active_slide = 0;
         self.canvas = self
             .slides
@@ -209,6 +287,9 @@ impl LibeRustOfficeSlidesApp {
         self.image_resize_drag = None;
         self.text_box_drag = None;
         self.fit_zoom_pending = true;
+        self.presentation_mode = false;
+        self.presentation_revealed_effects = 0;
+        self.presentation_effect_started_at = None;
         self.document_name = loaded.document_name;
         self.next_box_id = self
             .slides
@@ -294,7 +375,331 @@ impl LibeRustOfficeSlidesApp {
         self.image_resize_drag = None;
         self.text_box_drag = None;
         self.fit_zoom_pending = true;
+        if self.presentation_mode {
+            self.reset_presentation_effects();
+        }
         self.status = format!("Selected slide {}", index + 1);
+    }
+
+    fn enter_presentation_mode(&mut self, ctx: &egui::Context) {
+        self.sync_active_slide();
+        self.selected_box = None;
+        self.selection_anchor = None;
+        self.image_resize_drag = None;
+        self.text_box_drag = None;
+        self.presentation_mode = true;
+        self.reset_presentation_effects();
+        self.status = format!("Presenting slide {}", self.active_slide + 1);
+        write_animation_telemetry(format!(
+            "presentation_enter slide={} effect_count={}",
+            self.active_slide + 1,
+            self.current_presentation_effect_count()
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+    }
+
+    fn exit_presentation_mode(&mut self, ctx: &egui::Context) {
+        self.presentation_mode = false;
+        self.fit_zoom_pending = true;
+        self.status = format!("Exited presentation on slide {}", self.active_slide + 1);
+        write_animation_telemetry(format!("presentation_exit slide={}", self.active_slide + 1));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    }
+
+    fn reset_presentation_effects(&mut self) {
+        self.presentation_revealed_effects = 0;
+        self.presentation_effect_started_at = None;
+    }
+
+    fn current_presentation_effect_count(&self) -> usize {
+        self.canvas
+            .boxes
+            .iter()
+            .filter(|render_box| {
+                render_box.animation.as_ref().is_some_and(|animation| {
+                    matches!(animation.kind, AnimationKind::Entrance { .. })
+                })
+            })
+            .count()
+    }
+
+    fn presentation_advance(&mut self, ctx: &egui::Context) {
+        let effect_count = self.current_presentation_effect_count();
+        if self.presentation_revealed_effects < effect_count {
+            self.presentation_revealed_effects += 1;
+            self.presentation_effect_started_at = Some(ctx.input(|input| input.time));
+            write_animation_telemetry(format!(
+                "presentation_advance slide={} revealed_effects={} effect_count={}",
+                self.active_slide + 1,
+                self.presentation_revealed_effects,
+                effect_count
+            ));
+            return;
+        }
+        self.presentation_next_slide();
+    }
+
+    fn presentation_next_slide(&mut self) {
+        if self.active_slide + 1 < self.slides.len() {
+            self.select_slide(self.active_slide + 1);
+        }
+    }
+
+    fn presentation_previous_slide(&mut self) {
+        if self.active_slide > 0 {
+            self.select_slide(self.active_slide - 1);
+        }
+    }
+
+    fn handle_presentation_input(&mut self, ctx: &egui::Context) {
+        let events = ctx.input(|input| input.events.clone());
+        for event in events {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if modifiers.command || modifiers.ctrl || modifiers.alt {
+                continue;
+            }
+
+            match key {
+                egui::Key::Escape => self.exit_presentation_mode(ctx),
+                egui::Key::ArrowRight
+                | egui::Key::ArrowDown
+                | egui::Key::PageDown
+                | egui::Key::Space => self.presentation_advance(ctx),
+                egui::Key::ArrowLeft | egui::Key::ArrowUp | egui::Key::PageUp => {
+                    self.presentation_previous_slide();
+                }
+                egui::Key::Home => self.select_slide(0),
+                egui::Key::End => {
+                    if !self.slides.is_empty() {
+                        self.select_slide(self.slides.len() - 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let advance_from_click = ctx.input(|input| {
+            input.pointer.button_pressed(egui::PointerButton::Primary)
+                || input.pointer.button_pressed(egui::PointerButton::Secondary)
+        });
+        if advance_from_click {
+            self.presentation_advance(ctx);
+        }
+    }
+
+    fn handle_editor_shortcuts(&mut self, ctx: &egui::Context) {
+        let start_presentation = ctx.input(|input| {
+            input.key_pressed(egui::Key::F5)
+                && !input.modifiers.command
+                && !input.modifiers.ctrl
+                && !input.modifiers.alt
+        });
+        if start_presentation {
+            self.enter_presentation_mode(ctx);
+        }
+    }
+
+    fn presentation_canvas(&self, ctx: &egui::Context) -> RichCanvas {
+        let mut canvas = self.canvas.clone();
+        let now = ctx.input(|input| input.time);
+        let mut effect_index = 0usize;
+
+        for render_box in &mut canvas.boxes {
+            let Some(animation) = &render_box.animation else {
+                continue;
+            };
+            let (effect, duration_seconds, fly_direction) = match animation.kind {
+                AnimationKind::Entrance {
+                    effect,
+                    direction,
+                    duration_seconds,
+                } => (effect, duration_seconds, direction),
+                AnimationKind::PreviewOscillation => continue,
+            };
+
+            if effect_index >= self.presentation_revealed_effects {
+                write_animation_telemetry(format!(
+                    "effect_hidden slide={} box_id={} effect_index={} effect={:?} duration={:.3}",
+                    self.active_slide + 1,
+                    render_box.id,
+                    effect_index,
+                    effect,
+                    duration_seconds
+                ));
+                render_box.visible = false;
+                effect_index += 1;
+                continue;
+            }
+
+            if effect_index + 1 == self.presentation_revealed_effects {
+                let elapsed = self
+                    .presentation_effect_started_at
+                    .map(|started| (now - started).max(0.0) as f32)
+                    .unwrap_or(duration_seconds);
+                let progress = (elapsed / duration_seconds).clamp(0.0, 1.0);
+                write_animation_telemetry(format!(
+                    "effect_render slide={} box_id={} effect_index={} effect={:?} duration={:.3} elapsed={:.3} progress={:.3}",
+                    self.active_slide + 1,
+                    render_box.id,
+                    effect_index,
+                    effect,
+                    duration_seconds,
+                    elapsed,
+                    progress
+                ));
+                Self::apply_presentation_entrance_effect(
+                    render_box,
+                    effect,
+                    fly_direction,
+                    canvas.page.size,
+                    progress,
+                );
+            }
+
+            effect_index += 1;
+        }
+
+        canvas
+    }
+
+    fn draw_presentation_mode(&mut self, ctx: &egui::Context) {
+        self.handle_presentation_input(ctx);
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                let painter = ui.painter_at(rect);
+
+                self.presentation_canvas(ctx)
+                    .paint_page_preview(&painter, rect);
+
+                let label = format!("{} / {}", self.active_slide + 1, self.slides.len());
+                painter.text(
+                    rect.right_bottom() - egui::vec2(24.0, 20.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    label,
+                    egui::FontId::proportional(16.0),
+                    egui::Color32::from_white_alpha(190),
+                );
+            });
+    }
+
+    fn presentation_fly_in_offset(
+        direction: FlyInDirection,
+        page_size: egui::Vec2,
+        position: egui::Pos2,
+        size: egui::Vec2,
+    ) -> egui::Vec2 {
+        match direction {
+            FlyInDirection::FromLeft => egui::vec2(-(position.x + size.x * 0.5).max(0.0), 0.0),
+            FlyInDirection::FromRight => {
+                egui::vec2((page_size.x - position.x + size.x * 0.5).max(0.0), 0.0)
+            }
+            FlyInDirection::FromTop => egui::vec2(0.0, -(position.y + size.y * 0.5).max(0.0)),
+            FlyInDirection::FromBottom => {
+                egui::vec2(0.0, (page_size.y - position.y + size.y * 0.5).max(0.0))
+            }
+        }
+    }
+
+    fn apply_presentation_entrance_effect(
+        render_box: &mut RenderBox,
+        effect: EntranceEffect,
+        direction: Option<FlyInDirection>,
+        page_size: egui::Vec2,
+        progress: f32,
+    ) {
+        let eased = ease_out(progress);
+        match effect {
+            EntranceEffect::Appear => {}
+            EntranceEffect::FadeIn => {
+                apply_image_opacity(render_box, eased);
+            }
+            EntranceEffect::DissolveIn => {
+                apply_image_reveal_mask(render_box, effect, eased);
+            }
+            EntranceEffect::FlyIn | EntranceEffect::FlyInSlow => {
+                let direction = direction.unwrap_or(FlyInDirection::FromBottom);
+                let offset = Self::presentation_fly_in_offset(
+                    direction,
+                    page_size,
+                    render_box.position,
+                    render_box.size,
+                );
+                render_box.position += offset * (1.0 - eased);
+            }
+            EntranceEffect::Bounce => {
+                let offset = Self::presentation_fly_in_offset(
+                    FlyInDirection::FromTop,
+                    page_size,
+                    render_box.position,
+                    render_box.size,
+                );
+                let bounce =
+                    (progress * std::f32::consts::PI * 3.0).sin().abs() * (1.0 - progress) * 28.0;
+                render_box.position += offset * (1.0 - eased) + egui::vec2(0.0, bounce);
+            }
+            EntranceEffect::Glide | EntranceEffect::Float => {
+                let offset = Self::presentation_fly_in_offset(
+                    direction.unwrap_or(FlyInDirection::FromBottom),
+                    page_size,
+                    render_box.position,
+                    render_box.size,
+                ) * 0.35;
+                render_box.position += offset * (1.0 - eased);
+            }
+            EntranceEffect::SpiralIn => {
+                let radius = 180.0 * (1.0 - eased);
+                let angle = progress * std::f32::consts::TAU * 1.5;
+                render_box.position += egui::vec2(angle.cos() * radius, angle.sin() * radius);
+                apply_centered_scale(render_box, 0.25 + 0.75 * eased);
+            }
+            EntranceEffect::Boomerang | EntranceEffect::Sling => {
+                let offset = Self::presentation_fly_in_offset(
+                    FlyInDirection::FromRight,
+                    page_size,
+                    render_box.position,
+                    render_box.size,
+                ) * 0.45;
+                render_box.position += offset * (1.0 - eased);
+                render_box.rotation += (1.0 - eased) * 180.0;
+            }
+            EntranceEffect::SpinIn => {
+                render_box.rotation += (1.0 - eased) * 360.0;
+                apply_centered_scale(render_box, 0.2 + 0.8 * eased);
+            }
+            EntranceEffect::VenetianBlinds
+            | EntranceEffect::Checkerboard
+            | EntranceEffect::Wipe
+            | EntranceEffect::RandomBars
+            | EntranceEffect::Split
+            | EntranceEffect::Wheel
+            | EntranceEffect::Box
+            | EntranceEffect::Circle
+            | EntranceEffect::Oval
+            | EntranceEffect::Plus
+            | EntranceEffect::Diamond => {
+                if !apply_image_reveal_mask(render_box, effect, eased) {
+                    apply_centered_scale(render_box, eased.max(0.05));
+                }
+            }
+            EntranceEffect::FadeInAndZoom | EntranceEffect::Magnify => {
+                apply_image_opacity(render_box, eased);
+                apply_centered_scale(render_box, (0.05 + 0.95 * eased).clamp(0.05, 1.0));
+            }
+            EntranceEffect::Zoom | EntranceEffect::Expand => {
+                apply_centered_scale(render_box, (0.05 + 0.95 * eased).clamp(0.05, 1.0));
+            }
+        }
     }
 
     fn apply_pending_fit_zoom(&mut self, viewport_size: egui::Vec2) {
@@ -370,6 +775,15 @@ impl LibeRustOfficeSlidesApp {
             }
             if ui.button("Table").clicked() {
                 self.insert_table_box();
+                ui.close();
+            }
+        });
+    }
+
+    fn draw_presentation_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.menu_button("Presentation", |ui| {
+            if ui.button("Start Fullscreen").clicked() {
+                self.enter_presentation_mode(ctx);
                 ui.close();
             }
         });
@@ -1149,16 +1563,30 @@ impl LibeRustOfficeSlidesApp {
             return;
         };
 
-        let mut enabled = render_box.animation.is_some();
+        if render_box
+            .animation
+            .as_ref()
+            .is_some_and(|animation| matches!(animation.kind, AnimationKind::Entrance { .. }))
+        {
+            ui.label("Imported presentation animation");
+            return;
+        }
+
+        let mut enabled = render_box
+            .animation
+            .as_ref()
+            .is_some_and(|animation| animation.is_preview_oscillation());
         if ui.checkbox(&mut enabled, "Preview animation").changed() {
-            render_box.animation = enabled.then_some(AnimationSpec {
-                phase: self.phase,
-                amplitude: egui::vec2(6.0, 0.0),
-            });
+            render_box.animation = enabled.then_some(AnimationSpec::preview_oscillation(
+                self.phase,
+                egui::vec2(6.0, 0.0),
+            ));
             self.status = format!("Updated animation for object #{selected_id}");
         }
 
-        if let Some(animation) = &mut render_box.animation {
+        if let Some(animation) = &mut render_box.animation
+            && animation.is_preview_oscillation()
+        {
             ui.separator();
             let mut changed = false;
             changed |=
@@ -1829,14 +2257,26 @@ impl App for LibeRustOfficeSlidesApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
         self.advance_animation_phase();
-        self.handle_keyboard_editing(ctx);
         ctx.request_repaint();
+
+        if self.presentation_mode {
+            self.draw_presentation_mode(ctx);
+            return;
+        }
+
+        self.handle_editor_shortcuts(ctx);
+        if self.presentation_mode {
+            self.draw_presentation_mode(ctx);
+            return;
+        }
+        self.handle_keyboard_editing(ctx);
 
         egui::TopBottomPanel::top("app_menu_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 self.draw_file_menu(ui);
                 empty_menu(ui, "Edit");
                 self.draw_insert_menu(ui);
+                self.draw_presentation_menu(ui, ctx);
                 empty_menu(ui, "Settings");
                 ui.menu_button("Help", |ui| {
                     ui.label("Author: mrjacob241");
@@ -2202,6 +2642,140 @@ fn document_name_from_path(path: impl AsRef<Path>) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("Untitled.odp")
         .to_owned()
+}
+
+fn ease_out(progress: f32) -> f32 {
+    1.0 - (1.0 - progress).powi(3)
+}
+
+fn apply_centered_scale(render_box: &mut RenderBox, scale: f32) {
+    let scale = scale.clamp(0.01, 1.0);
+    let original_visual_size = egui::vec2(
+        render_box.size.x * render_box.scale.x,
+        render_box.size.y * render_box.scale.y,
+    );
+    render_box.scale *= scale;
+    let next_visual_size = egui::vec2(
+        render_box.size.x * render_box.scale.x,
+        render_box.size.y * render_box.scale.y,
+    );
+    render_box.position += (original_visual_size - next_visual_size) * 0.5;
+}
+
+fn apply_image_opacity(render_box: &mut RenderBox, opacity: f32) -> bool {
+    let RenderBoxKind::Image(image) = &mut render_box.kind else {
+        return false;
+    };
+    let opacity = opacity.clamp(0.0, 1.0);
+    for pixel in &mut image.color_image.pixels {
+        let alpha = (pixel.a() as f32 * opacity).round().clamp(0.0, 255.0) as u8;
+        *pixel = egui::Color32::from_rgba_unmultiplied(pixel.r(), pixel.g(), pixel.b(), alpha);
+    }
+    image.invalidate_texture();
+    true
+}
+
+fn apply_image_reveal_mask(
+    render_box: &mut RenderBox,
+    effect: EntranceEffect,
+    progress: f32,
+) -> bool {
+    let RenderBoxKind::Image(image) = &mut render_box.kind else {
+        return false;
+    };
+    let width = image.color_image.size[0];
+    let height = image.color_image.size[1];
+    if width == 0 || height == 0 {
+        return false;
+    }
+
+    let progress = progress.clamp(0.0, 1.0);
+    let threshold = (progress * 2.0).clamp(0.0, 2.0);
+    let horizontal_limit = (width as f32 * progress).round() as usize;
+    let center_x = (width.saturating_sub(1)) as f32 * 0.5;
+    let center_y = (height.saturating_sub(1)) as f32 * 0.5;
+    let half_w = center_x.max(1.0);
+    let half_h = center_y.max(1.0);
+    let checker_step = ((width.min(height) as f32) / 10.0).round().max(4.0) as usize;
+    let bar_count = 12usize;
+    let wheel_segments = 8usize;
+    let mut kept_pixels = 0usize;
+    let mut hidden_pixels = 0usize;
+
+    if progress < 1.0 {
+        render_box.style.fill = egui::Color32::TRANSPARENT;
+        render_box.style.stroke = egui::Color32::TRANSPARENT;
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            let nx = ((x as f32 - center_x) / half_w).abs();
+            let ny = ((y as f32 - center_y) / half_h).abs();
+            let dx = x as f32 - center_x;
+            let dy = y as f32 - center_y;
+            let keep = match effect {
+                EntranceEffect::Diamond => nx + ny <= threshold,
+                EntranceEffect::Circle => (nx * nx + ny * ny).sqrt() <= progress,
+                EntranceEffect::Oval => (nx * nx * 0.65 + ny * ny).sqrt() <= progress,
+                EntranceEffect::Box => nx <= progress && ny <= progress,
+                EntranceEffect::Wipe => x < horizontal_limit,
+                EntranceEffect::Split => nx <= progress,
+                EntranceEffect::Plus => nx <= progress || ny <= progress,
+                EntranceEffect::DissolveIn => {
+                    let pseudo = ((x.wrapping_mul(73_856_093) ^ y.wrapping_mul(19_349_663)) & 1023)
+                        as f32
+                        / 1023.0;
+                    pseudo <= progress
+                }
+                EntranceEffect::Wheel => {
+                    let mut angle = dy.atan2(dx);
+                    if angle < 0.0 {
+                        angle += std::f32::consts::TAU;
+                    }
+                    let segment =
+                        ((angle / std::f32::consts::TAU) * wheel_segments as f32).floor() as usize;
+                    let radius = (nx * nx + ny * ny).sqrt();
+                    segment as f32 / wheel_segments as f32 <= progress && radius <= threshold
+                }
+                EntranceEffect::VenetianBlinds => {
+                    let stripe = y / checker_step;
+                    let stripe_top = stripe * checker_step;
+                    let stripe_height = checker_step.min(height.saturating_sub(stripe_top));
+                    let revealed_height = (stripe_height as f32 * progress).round() as usize;
+                    y.saturating_sub(stripe_top) < revealed_height
+                }
+                EntranceEffect::Checkerboard => {
+                    let cell_x = x / checker_step;
+                    let cell_y = y / checker_step;
+                    let phase = (progress * 2.0).floor() as usize;
+                    ((cell_x + cell_y + phase) % 2 == 0 && progress > 0.15) || progress > 0.65
+                }
+                EntranceEffect::RandomBars => {
+                    let bar = (y * bar_count / height).min(bar_count - 1);
+                    let pseudo = ((bar * 37 + 11) % bar_count) as f32 / bar_count as f32;
+                    pseudo <= progress
+                }
+                _ => return false,
+            };
+
+            if !keep {
+                let index = y * width + x;
+                let pixel = image.color_image.pixels[index];
+                image.color_image.pixels[index] =
+                    egui::Color32::from_rgba_unmultiplied(pixel.r(), pixel.g(), pixel.b(), 0);
+                hidden_pixels += 1;
+            } else {
+                kept_pixels += 1;
+            }
+        }
+    }
+
+    image.invalidate_texture();
+    write_animation_telemetry(format!(
+        "mask_render box_id={} effect={:?} progress={:.3} image={}x{} kept_pixels={} hidden_pixels={}",
+        render_box.id, effect, progress, width, height, kept_pixels, hidden_pixels
+    ));
+    true
 }
 
 fn configure_local_editor_fonts(ctx: &egui::Context) {

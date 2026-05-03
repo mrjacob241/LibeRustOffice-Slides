@@ -13,8 +13,9 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 use rich_canvas::{
-    BoxStrokeKind, BoxStyle, ImageBlock, LayoutRole, RenderBox, RenderBoxKind, RichCanvas,
-    TextAlignment, TextRun, TextStyle, TextVerticalAlignment,
+    AnimationKind, AnimationSpec, BoxStrokeKind, BoxStyle, EntranceEffect, FlyInDirection,
+    ImageBlock, LayoutRole, RenderBox, RenderBoxKind, RichCanvas, TextAlignment, TextRun,
+    TextStyle, TextVerticalAlignment,
 };
 
 const ODP_MIME_TYPE: &str = "application/vnd.oasis.opendocument.presentation";
@@ -1248,11 +1249,17 @@ impl<'a> SlideImporter<'a> {
         let mut text_depth = 0usize;
         let mut style_stack = Vec::new();
         let mut z_index = 0i32;
+        let mut frame_ids: HashMap<String, u64> = HashMap::new();
+        let mut pending_animations: Vec<(String, AnimationSpec)> = Vec::new();
+        let mut preset_stack: Vec<Option<String>> = Vec::new();
 
         loop {
             match reader.read_event() {
                 Ok(Event::Start(event)) if local_name(event.name().as_ref()) == b"page" => {
                     if in_notes == 0 {
+                        frame_ids.clear();
+                        pending_animations.clear();
+                        preset_stack.clear();
                         let mut slide = new_slide_canvas(self.styles.page_size);
                         self.push_master_background_images(
                             &mut slide,
@@ -1304,11 +1311,16 @@ impl<'a> SlideImporter<'a> {
                 }
                 Ok(Event::End(event)) if local_name(event.name().as_ref()) == b"frame" => {
                     if let (Some(slide), Some(import)) = (canvas.as_mut(), frame.take()) {
+                        let frame_xml_id = import.xml_id.clone();
                         if let Some(mut render_box) =
                             import.into_render_box(self.next_box_id, self.package)?
                         {
                             render_box.z_index = z_index;
+                            if let Some(frame_xml_id) = frame_xml_id {
+                                frame_ids.insert(frame_xml_id, render_box.id);
+                            }
                             slide.push(render_box);
+                            apply_pending_animations(slide, &frame_ids, &pending_animations);
                             self.next_box_id += 1;
                             z_index += 1;
                         }
@@ -1361,6 +1373,80 @@ impl<'a> SlideImporter<'a> {
                 }
                 Ok(Event::End(event)) if local_name(event.name().as_ref()) == b"span" => {
                     style_stack.pop();
+                }
+                Ok(Event::Start(event))
+                    if canvas.is_some()
+                        && in_notes == 0
+                        && local_name(event.name().as_ref()) == b"par" =>
+                {
+                    preset_stack.push(attr(&event, reader.decoder(), b"preset-id"));
+                }
+                Ok(Event::End(event))
+                    if canvas.is_some()
+                        && in_notes == 0
+                        && local_name(event.name().as_ref()) == b"par" =>
+                {
+                    preset_stack.pop();
+                }
+                Ok(Event::Start(event)) | Ok(Event::Empty(event))
+                    if canvas.is_some()
+                        && in_notes == 0
+                        && local_name(event.name().as_ref()) == b"animate" =>
+                {
+                    let preset_id = current_preset_id(&preset_stack);
+                    if let Some((target, animation)) =
+                        parse_animate_animation(&event, reader.decoder(), preset_id)
+                    {
+                        pending_animations.push((target, animation));
+                        if let Some(slide) = canvas.as_mut() {
+                            apply_pending_animations(slide, &frame_ids, &pending_animations);
+                        }
+                    }
+                }
+                Ok(Event::Start(event)) | Ok(Event::Empty(event))
+                    if canvas.is_some()
+                        && in_notes == 0
+                        && local_name(event.name().as_ref()) == b"animateTransform" =>
+                {
+                    let preset_id = current_preset_id(&preset_stack);
+                    if let Some((target, animation)) =
+                        parse_animate_transform_animation(&event, reader.decoder(), preset_id)
+                    {
+                        pending_animations.push((target, animation));
+                        if let Some(slide) = canvas.as_mut() {
+                            apply_pending_animations(slide, &frame_ids, &pending_animations);
+                        }
+                    }
+                }
+                Ok(Event::Start(event)) | Ok(Event::Empty(event))
+                    if canvas.is_some()
+                        && in_notes == 0
+                        && local_name(event.name().as_ref()) == b"transitionFilter" =>
+                {
+                    let preset_id = current_preset_id(&preset_stack);
+                    if let Some((target, animation)) =
+                        parse_transition_filter_animation(&event, reader.decoder(), preset_id)
+                    {
+                        pending_animations.push((target, animation));
+                        if let Some(slide) = canvas.as_mut() {
+                            apply_pending_animations(slide, &frame_ids, &pending_animations);
+                        }
+                    }
+                }
+                Ok(Event::Start(event)) | Ok(Event::Empty(event))
+                    if canvas.is_some()
+                        && in_notes == 0
+                        && local_name(event.name().as_ref()) == b"set" =>
+                {
+                    let preset_id = current_preset_id(&preset_stack);
+                    if let Some((target, animation)) =
+                        parse_set_animation(&event, reader.decoder(), preset_id)
+                    {
+                        pending_animations.push((target, animation));
+                        if let Some(slide) = canvas.as_mut() {
+                            apply_pending_animations(slide, &frame_ids, &pending_animations);
+                        }
+                    }
                 }
                 Ok(Event::Start(event)) | Ok(Event::Empty(event))
                     if frame.is_some() && local_name(event.name().as_ref()) == b"image" =>
@@ -1460,6 +1546,200 @@ struct FrameImport {
     box_style: Option<BoxStyle>,
     runs: Vec<TextRun>,
     image_href: Option<String>,
+    xml_id: Option<String>,
+}
+
+fn current_preset_id(preset_stack: &[Option<String>]) -> Option<&str> {
+    preset_stack
+        .iter()
+        .rev()
+        .find_map(|preset| preset.as_deref())
+}
+
+fn parse_animate_animation(
+    event: &BytesStart<'_>,
+    decoder: Decoder,
+    preset_id: Option<&str>,
+) -> Option<(String, AnimationSpec)> {
+    let target = attr(event, decoder, b"targetElement")?;
+    let attribute_name = attr(event, decoder, b"attributeName")?;
+    let values = attr(event, decoder, b"values").unwrap_or_default();
+    let duration = attr(event, decoder, b"dur")
+        .and_then(|value| parse_seconds(&value))
+        .unwrap_or(0.5);
+
+    let direction = match attribute_name.as_str() {
+        "x" if values.contains("width/2") && values.contains("1+") => {
+            Some(FlyInDirection::FromRight)
+        }
+        "x" if values.contains("width/2") => Some(FlyInDirection::FromLeft),
+        "y" if values.contains("height/2") && values.contains("1+") => {
+            Some(FlyInDirection::FromBottom)
+        }
+        "y" if values.contains("height/2") => Some(FlyInDirection::FromTop),
+        _ => None,
+    };
+
+    if let Some(preset_id) = preset_id {
+        if let Some(animation) = animation_from_preset(preset_id, duration, direction) {
+            return Some((target, animation));
+        }
+    }
+
+    let direction = direction?;
+
+    Some((target, AnimationSpec::entrance_fly_in(direction, duration)))
+}
+
+fn parse_animate_transform_animation(
+    event: &BytesStart<'_>,
+    decoder: Decoder,
+    preset_id: Option<&str>,
+) -> Option<(String, AnimationSpec)> {
+    let target = attr(event, decoder, b"targetElement")?;
+    let duration = attr(event, decoder, b"dur")
+        .and_then(|value| parse_seconds(&value))
+        .unwrap_or(0.5);
+    let preset_id = preset_id?;
+    let animation = animation_from_preset(preset_id, duration, None)?;
+    Some((target, animation))
+}
+
+fn parse_transition_filter_animation(
+    event: &BytesStart<'_>,
+    decoder: Decoder,
+    preset_id: Option<&str>,
+) -> Option<(String, AnimationSpec)> {
+    let target = attr(event, decoder, b"targetElement")?;
+    let duration = attr(event, decoder, b"dur")
+        .and_then(|value| parse_seconds(&value))
+        .unwrap_or(0.5);
+    let transition_preset = transition_filter_preset(event, decoder);
+    let preset_id = preset_id.or(transition_preset.as_deref())?;
+    let animation = animation_from_preset(preset_id, duration, None)?;
+    Some((target, animation))
+}
+
+fn parse_set_animation(
+    event: &BytesStart<'_>,
+    decoder: Decoder,
+    _preset_id: Option<&str>,
+) -> Option<(String, AnimationSpec)> {
+    let target = attr(event, decoder, b"targetElement")?;
+    let attribute_name = attr(event, decoder, b"attributeName")?;
+    let to = attr(event, decoder, b"to")?;
+    if attribute_name != "visibility" || to != "visible" {
+        return None;
+    }
+
+    let duration = attr(event, decoder, b"dur")
+        .and_then(|value| parse_seconds(&value))
+        .unwrap_or(0.001);
+    Some((target, AnimationSpec::entrance_appear(duration)))
+}
+
+fn transition_filter_preset(event: &BytesStart<'_>, decoder: Decoder) -> Option<String> {
+    let transition_type = attr(event, decoder, b"type")?;
+    let subtype = attr(event, decoder, b"subtype").unwrap_or_default();
+    let preset_id = match transition_type.as_str() {
+        "blindsWipe" => "ooo-entrance-venetian-blinds",
+        "irisWipe" if subtype == "diamond" => "ooo-entrance-diamond",
+        "irisWipe" => "ooo-entrance-box",
+        "checkerBoardWipe" => "ooo-entrance-checkerboard",
+        "ellipseWipe" if subtype == "vertical" => "ooo-entrance-oval",
+        "ellipseWipe" => "ooo-entrance-circle",
+        "dissolve" => "ooo-entrance-dissolve-in",
+        "barWipe" => "ooo-entrance-wipe",
+        "pinWheelWipe" => "ooo-entrance-wheel",
+        "randomBarWipe" => "ooo-entrance-random-bars",
+        "barnDoorWipe" => "ooo-entrance-split",
+        "fourBoxWipe" => "ooo-entrance-plus",
+        _ => return None,
+    };
+    Some(preset_id.to_owned())
+}
+
+fn animation_from_preset(
+    preset_id: &str,
+    duration: f32,
+    direction: Option<FlyInDirection>,
+) -> Option<AnimationSpec> {
+    let effect = match preset_id {
+        "ooo-entrance-appear" => EntranceEffect::Appear,
+        "ooo-entrance-venetian-blinds" => EntranceEffect::VenetianBlinds,
+        "ooo-entrance-box" => EntranceEffect::Box,
+        "ooo-entrance-checkerboard" => EntranceEffect::Checkerboard,
+        "ooo-entrance-circle" => EntranceEffect::Circle,
+        "ooo-entrance-oval" => EntranceEffect::Oval,
+        "ooo-entrance-fly-in" => EntranceEffect::FlyIn,
+        "ooo-entrance-fly-in-slow" => EntranceEffect::FlyInSlow,
+        "ooo-entrance-dissolve-in" => EntranceEffect::DissolveIn,
+        "ooo-entrance-fade-in" => EntranceEffect::FadeIn,
+        "ooo-entrance-fade-in-and-zoom" => EntranceEffect::FadeInAndZoom,
+        "ooo-entrance-zoom" => EntranceEffect::Zoom,
+        "ooo-entrance-expand" => EntranceEffect::Expand,
+        "ooo-entrance-spin-in" => EntranceEffect::SpinIn,
+        "ooo-entrance-bounce" => EntranceEffect::Bounce,
+        "ooo-entrance-spiral-in" => EntranceEffect::SpiralIn,
+        "ooo-entrance-boomerang" => EntranceEffect::Boomerang,
+        "ooo-entrance-sling" => EntranceEffect::Sling,
+        "ooo-entrance-glide" => EntranceEffect::Glide,
+        "ooo-entrance-float" => EntranceEffect::Float,
+        "ooo-entrance-magnify" => EntranceEffect::Magnify,
+        "ooo-entrance-wipe" => EntranceEffect::Wipe,
+        "ooo-entrance-wheel" => EntranceEffect::Wheel,
+        "ooo-entrance-random-bars" => EntranceEffect::RandomBars,
+        "ooo-entrance-split" => EntranceEffect::Split,
+        "ooo-entrance-plus" => EntranceEffect::Plus,
+        "ooo-entrance-diamond" => EntranceEffect::Diamond,
+        _ => return None,
+    };
+
+    let duration = if effect == EntranceEffect::FlyInSlow {
+        duration.max(5.0)
+    } else {
+        duration
+    };
+    Some(AnimationSpec::entrance(effect, direction, duration))
+}
+
+fn apply_pending_animations(
+    slide: &mut RichCanvas,
+    frame_ids: &HashMap<String, u64>,
+    pending_animations: &[(String, AnimationSpec)],
+) {
+    for (target, animation) in pending_animations {
+        let Some(box_id) = frame_ids.get(target) else {
+            continue;
+        };
+        let Some(render_box) = slide.box_mut(*box_id) else {
+            continue;
+        };
+        let should_replace = render_box.animation.as_ref().is_none_or(|existing| {
+            matches!(
+                (&existing.kind, &animation.kind),
+                (
+                    AnimationKind::Entrance {
+                        effect: EntranceEffect::Appear,
+                        ..
+                    },
+                    AnimationKind::Entrance { .. }
+                )
+            )
+        });
+        if should_replace {
+            render_box.animation = Some(animation.clone());
+        }
+    }
+}
+
+fn parse_seconds(value: &str) -> Option<f32> {
+    value
+        .strip_suffix('s')
+        .unwrap_or(value)
+        .parse::<f32>()
+        .ok()
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
 }
 
 impl FrameImport {
@@ -1487,6 +1767,7 @@ impl FrameImport {
             box_style: None,
             runs: Vec::new(),
             image_href: None,
+            xml_id: attr(event, decoder, b"id"),
         }
     }
 
@@ -1666,9 +1947,9 @@ fn attr_qualified(event: &BytesStart<'_>, decoder: Decoder, qualified: &[u8]) ->
 
 fn frame_alignment_style_names(event: &BytesStart<'_>, decoder: Decoder) -> Vec<String> {
     [
+        b"draw:text-style-name".as_slice(),
         b"draw:style-name".as_slice(),
         b"presentation:style-name".as_slice(),
-        b"draw:text-style-name".as_slice(),
     ]
     .into_iter()
     .filter_map(|name| attr_qualified(event, decoder, name))
@@ -1791,6 +2072,19 @@ mod tests {
         }));
         assert!(loaded.slides[1].boxes.iter().any(RenderBox::is_image));
         assert!(loaded.slides[1].boxes.iter().any(|render_box| {
+            render_box.is_image()
+                && render_box.animation.as_ref().is_some_and(|animation| {
+                    matches!(
+                        animation.kind,
+                        rich_canvas::AnimationKind::Entrance {
+                            effect: EntranceEffect::VenetianBlinds,
+                            duration_seconds,
+                            ..
+                        } if (duration_seconds - 0.3125).abs() < 0.001
+                    )
+                })
+        }));
+        assert!(loaded.slides[1].boxes.iter().any(|render_box| {
             render_box.is_image() && render_box.z_index < 0 && render_box.position == Pos2::ZERO
         }));
         assert!(loaded.slides[2].boxes.iter().any(|render_box| {
@@ -1806,6 +2100,10 @@ mod tests {
             })
             .expect("third slide license text should load");
         assert!(license_box.lock_size);
+        assert!(matches!(
+            &license_box.kind,
+            RenderBoxKind::Text(block) if block.alignment == TextAlignment::Center
+        ));
         let locked_size = license_box.size;
         let mut gui_slide = loaded.slides[2].clone();
         gui_slide.relayout(rich_canvas::CanvasMode::SlideDeck);
@@ -1863,6 +2161,127 @@ mod tests {
             Some(Some(Color32::from_rgb(0xff, 0xf2, 0x00)))
         );
         assert_eq!(parse_background_color("transparent"), Some(None));
+    }
+
+    #[test]
+    fn parses_supported_entrance_animation_elements() {
+        let set_xml = r#"
+            <anim:set smil:dur="0.25s" smil:targetElement="id1"
+                smil:attributeName="visibility" smil:to="visible"/>
+        "#;
+        let mut reader = Reader::from_str(set_xml);
+        let set = loop {
+            match reader.read_event().expect("set XML should parse") {
+                Event::Empty(event) => break event,
+                Event::Eof => panic!("expected anim:set element"),
+                _ => {}
+            }
+        };
+        let (target, animation) =
+            parse_set_animation(&set, reader.decoder(), None).expect("set should import");
+        assert_eq!(target, "id1");
+        assert!(matches!(
+            animation.kind,
+            rich_canvas::AnimationKind::Entrance {
+                effect: rich_canvas::EntranceEffect::Appear,
+                duration_seconds
+                , ..
+            } if (duration_seconds - 0.25).abs() < 0.001
+        ));
+
+        let animate_xml = r#"
+            <anim:animate smil:dur="0.5s" smil:targetElement="id2"
+                smil:attributeName="x" smil:values="1+width/2;x"/>
+        "#;
+        let mut reader = Reader::from_str(animate_xml);
+        let animate = loop {
+            match reader.read_event().expect("animate XML should parse") {
+                Event::Empty(event) => break event,
+                Event::Eof => panic!("expected anim:animate element"),
+                _ => {}
+            }
+        };
+        let (target, animation) = parse_animate_animation(&animate, reader.decoder(), None)
+            .expect("animate should import");
+        assert_eq!(target, "id2");
+        assert!(matches!(
+            animation.kind,
+            rich_canvas::AnimationKind::Entrance {
+                effect: rich_canvas::EntranceEffect::FlyIn,
+                direction: Some(rich_canvas::FlyInDirection::FromRight),
+                duration_seconds
+                , ..
+            } if (duration_seconds - 0.5).abs() < 0.001
+        ));
+    }
+
+    #[test]
+    fn maps_all_documented_entrance_animation_presets() {
+        let presets = [
+            "ooo-entrance-appear",
+            "ooo-entrance-venetian-blinds",
+            "ooo-entrance-box",
+            "ooo-entrance-checkerboard",
+            "ooo-entrance-circle",
+            "ooo-entrance-oval",
+            "ooo-entrance-fly-in",
+            "ooo-entrance-fly-in-slow",
+            "ooo-entrance-dissolve-in",
+            "ooo-entrance-fade-in",
+            "ooo-entrance-fade-in-and-zoom",
+            "ooo-entrance-zoom",
+            "ooo-entrance-expand",
+            "ooo-entrance-spin-in",
+            "ooo-entrance-bounce",
+            "ooo-entrance-spiral-in",
+            "ooo-entrance-boomerang",
+            "ooo-entrance-sling",
+            "ooo-entrance-glide",
+            "ooo-entrance-float",
+            "ooo-entrance-magnify",
+            "ooo-entrance-wipe",
+            "ooo-entrance-wheel",
+            "ooo-entrance-random-bars",
+            "ooo-entrance-split",
+            "ooo-entrance-plus",
+            "ooo-entrance-diamond",
+        ];
+
+        for preset in presets {
+            assert!(
+                animation_from_preset(preset, 0.5, Some(rich_canvas::FlyInDirection::FromBottom))
+                    .is_some(),
+                "preset should be mapped: {preset}"
+            );
+        }
+    }
+
+    #[test]
+    fn transition_filter_replaces_initial_appear_animation() {
+        let mut slide = RichCanvas::new(DEFAULT_SLIDE_SIZE);
+        let mut target = RenderBox::image(1, LayoutRole::Absolute, "target", vec2(120.0, 80.0));
+        target.animation = Some(AnimationSpec::entrance_appear(0.001));
+        slide.push(target);
+
+        let frame_ids = HashMap::from([("id1".to_owned(), 1)]);
+        let pending = vec![(
+            "id1".to_owned(),
+            AnimationSpec::entrance(EntranceEffect::Diamond, None, 0.8),
+        )];
+        apply_pending_animations(&mut slide, &frame_ids, &pending);
+
+        let animation = slide.boxes[0]
+            .animation
+            .as_ref()
+            .expect("target should keep an animation");
+        assert!(matches!(
+            animation.kind,
+            rich_canvas::AnimationKind::Entrance {
+                effect: EntranceEffect::Diamond,
+                duration_seconds,
+                ..
+            } if (duration_seconds - 0.8).abs() < 0.001
+        ));
     }
 
     #[test]

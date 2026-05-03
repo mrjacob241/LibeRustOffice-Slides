@@ -220,7 +220,9 @@ impl RichCanvas {
             render_box.measure();
             if let Some(animation) = &render_box.animation {
                 // Slide mode keeps explicit positions and applies preview transforms on top.
-                render_box.position += animation.preview_offset();
+                if animation.is_preview_oscillation() {
+                    render_box.position += animation.preview_offset();
+                }
             }
         }
 
@@ -2486,6 +2488,10 @@ impl ImageBlock {
             .clone()
     }
 
+    pub fn invalidate_texture(&mut self) {
+        self.texture = None;
+    }
+
     fn paint(&mut self, painter: &Painter, rect: Rect, image_id: u64) {
         let texture = self.texture_handle(painter, image_id);
         painter.image(
@@ -2639,9 +2645,95 @@ impl Default for BoxStyle {
 pub struct AnimationSpec {
     pub phase: f32,
     pub amplitude: Vec2,
+    pub kind: AnimationKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum AnimationKind {
+    PreviewOscillation,
+    Entrance {
+        effect: EntranceEffect,
+        direction: Option<FlyInDirection>,
+        duration_seconds: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntranceEffect {
+    Appear,
+    VenetianBlinds,
+    Box,
+    Checkerboard,
+    Circle,
+    Oval,
+    FlyIn,
+    FlyInSlow,
+    DissolveIn,
+    FadeIn,
+    FadeInAndZoom,
+    Zoom,
+    Expand,
+    SpinIn,
+    Bounce,
+    SpiralIn,
+    Boomerang,
+    Sling,
+    Glide,
+    Float,
+    Magnify,
+    Wipe,
+    Wheel,
+    RandomBars,
+    Split,
+    Plus,
+    Diamond,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlyInDirection {
+    FromLeft,
+    FromRight,
+    FromTop,
+    FromBottom,
 }
 
 impl AnimationSpec {
+    pub fn preview_oscillation(phase: f32, amplitude: Vec2) -> Self {
+        Self {
+            phase,
+            amplitude,
+            kind: AnimationKind::PreviewOscillation,
+        }
+    }
+
+    pub fn entrance_appear(duration_seconds: f32) -> Self {
+        Self::entrance(EntranceEffect::Appear, None, duration_seconds)
+    }
+
+    pub fn entrance_fly_in(direction: FlyInDirection, duration_seconds: f32) -> Self {
+        Self::entrance(EntranceEffect::FlyIn, Some(direction), duration_seconds)
+    }
+
+    pub fn entrance(
+        effect: EntranceEffect,
+        direction: Option<FlyInDirection>,
+        duration_seconds: f32,
+    ) -> Self {
+        Self {
+            phase: 0.0,
+            amplitude: Vec2::ZERO,
+            kind: AnimationKind::Entrance {
+                effect,
+                direction,
+                duration_seconds,
+            },
+        }
+    }
+
+    pub fn is_preview_oscillation(&self) -> bool {
+        matches!(self.kind, AnimationKind::PreviewOscillation)
+    }
+
     pub fn preview_offset(&self) -> Vec2 {
         // Preview animation is just a lightweight oscillating transform.
         vec2(

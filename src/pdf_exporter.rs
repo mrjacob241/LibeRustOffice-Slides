@@ -255,7 +255,7 @@ fn push_text_box(
     vertical_alignment: TextVerticalAlignment,
     page_h: f32,
 ) {
-    let vertices = rendered_box_vertices(render_box);
+    let vertices = rendered_text_box_vertices(render_box);
     let frame_rect = pdf_rect_from_rendered_vertices(vertices, page_h);
     push_text_box_frame(content, render_box, frame_rect);
 
@@ -372,6 +372,24 @@ struct PdfRect {
 
 fn rendered_box_vertices(render_box: &RenderBox) -> [Pos2; 4] {
     let rect = render_box.rect(Pos2::ZERO, 1.0);
+    [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ]
+}
+
+fn rendered_text_box_vertices(render_box: &RenderBox) -> [Pos2; 4] {
+    let size = if render_box.lock_size {
+        render_box.authored_size.unwrap_or(render_box.size)
+    } else {
+        render_box.size
+    };
+    let rect = egui::Rect::from_min_size(
+        render_box.position,
+        egui::vec2(size.x * render_box.scale.x, size.y * render_box.scale.y),
+    );
     [
         rect.left_top(),
         rect.right_top(),
@@ -830,6 +848,32 @@ mod tests {
         text.scale = vec2(1.25, 1.5);
 
         let vertices = rendered_box_vertices(&text);
+        assert_close(vertices[0].x, 80.0);
+        assert_close(vertices[0].y, 90.0);
+        assert_close(vertices[2].x, 480.0);
+        assert_close(vertices[2].y, 240.0);
+
+        let rect = pdf_rect_from_rendered_vertices(vertices, px_to_pt(720.0));
+        assert_close(rect.x, px_to_pt(80.0));
+        assert_close(rect.y, px_to_pt(720.0 - 240.0));
+        assert_close(rect.w, px_to_pt(400.0));
+        assert_close(rect.h, px_to_pt(150.0));
+    }
+
+    #[test]
+    fn pdf_text_box_frame_uses_authored_size() {
+        let mut text = RenderBox::text(
+            1,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Authored geometry", TextStyle::body())],
+        );
+        text.position = pos2(80.0, 90.0);
+        text.authored_size = Some(vec2(320.0, 100.0));
+        text.size = vec2(360.0, 140.0);
+        text.lock_size = true;
+        text.scale = vec2(1.25, 1.5);
+
+        let vertices = rendered_text_box_vertices(&text);
         assert_close(vertices[0].x, 80.0);
         assert_close(vertices[0].y, 90.0);
         assert_close(vertices[2].x, 480.0);

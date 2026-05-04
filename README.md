@@ -9,10 +9,10 @@
 
 - [x] Open and read 'odp' presentation files  
 - [x] First minimal save/save-as for 'odp' files, preserving supported text and image frames  
-- [ ] Print to File (PDF)
+- [x] Print to File (PDF)
 - [x] Basic slide rendering  
 - [x] Add and edit text elements  
-- [ ] Insert and resize images  
+- [x] Insert and resize images  
 - [ ] Basic bullet and numbered lists  
 - [ ] Keyboard shortcuts for productivity  
 - [x] Fast and lightweight (written in Rust 🦀)  
@@ -23,15 +23,15 @@
 - [ ] Themes and basic styling  
 - [ ] Undo / Redo functionality  
 - [ ] Slide transitions  
-- [ ] Animations for elements  
+- [x] Animations for elements  
 - [ ] Master slide support  
 - [ ] Notes view (speaker notes)  
 - [ ] Slide duplication and reordering  
-- [ ] Export to PDF  
+- [x] Export to PDF  
 - [ ] Real-time collaboration  
 - [ ] Cloud sync integration  
 - [ ] Full compatibility with LibreOffice   
-- [ ] Presenter mode  
+- [x] Presenter mode  
 - [ ] Native printing (Linux)
 - [ ] Spell checking and grammar suggestions  
 

@@ -2171,7 +2171,7 @@ mod tests {
     fn loads_default_odp_into_canvas_slides() {
         let loaded = load_default_odp().expect("default ODP should load");
         assert_eq!(loaded.document_name, "test_slides.odp");
-        assert_eq!(loaded.slides.len(), 3);
+        assert_eq!(loaded.slides.len(), 5);
         assert!(loaded.slides.iter().all(|slide| !slide.boxes.is_empty()));
         assert!(loaded.slides[0].boxes.iter().any(|render_box| {
             render_box.is_image() && render_box.z_index < 0 && render_box.position == Pos2::ZERO
@@ -2218,12 +2218,11 @@ mod tests {
                     matches!(
                         animation.kind,
                         rich_canvas::AnimationKind::Entrance {
-                            effect: EntranceEffect::VenetianBlinds,
+                            effect: EntranceEffect::FlyIn,
                             duration_seconds,
                             ..
-                        } if (duration_seconds - 0.3125).abs() < 0.001
-                    ) || matches!(animation.kind, rich_canvas::AnimationKind::Emphasis { .. })
-                        || matches!(animation.kind, rich_canvas::AnimationKind::Exit { .. })
+                        } if (duration_seconds - 0.5).abs() < 0.001
+                    )
                 })
         }));
         assert!(loaded.slides[1].boxes.iter().any(|render_box| {
@@ -2232,7 +2231,18 @@ mod tests {
         assert!(loaded.slides[2].boxes.iter().any(|render_box| {
             render_box.is_image() && render_box.z_index < 0 && render_box.position == Pos2::ZERO
         }));
-        let license_box = loaded.slides[2]
+        let license_slide = loaded
+            .slides
+            .iter()
+            .find(|slide| {
+                slide.boxes.iter().any(|render_box| {
+                    render_box
+                        .plain_text()
+                        .is_some_and(|text| text.contains("Creative Commons"))
+                })
+            })
+            .expect("license slide should load");
+        let license_box = license_slide
             .boxes
             .iter()
             .find(|render_box| {
@@ -2247,7 +2257,7 @@ mod tests {
             RenderBoxKind::Text(block) if block.alignment == TextAlignment::Center
         ));
         let locked_size = license_box.size;
-        let mut gui_slide = loaded.slides[2].clone();
+        let mut gui_slide = license_slide.clone();
         gui_slide.relayout(rich_canvas::CanvasMode::SlideDeck);
         let relaid_license_box = gui_slide
             .boxes

@@ -79,6 +79,9 @@ fn export_pdf_bytes(slides: &[RichCanvas]) -> Result<Vec<u8>, PdfExportError> {
         for image in &page.images {
             pdf.set_object(image.object_id, image_xobject(image));
         }
+        for annotation in &page.link_annotations {
+            pdf.set_object(annotation.object_id, link_annotation_object(annotation));
+        }
         pdf.set_object(page.content_id, stream_object(&page.content));
         pdf.set_object(page.page_id, page_object(&page));
     }
@@ -103,14 +106,26 @@ fn page_object(page: &PdfPageBuild) -> Vec<u8> {
         format!("/XObject << {entries} >>")
     };
 
+    let annots = if page.link_annotations.is_empty() {
+        String::new()
+    } else {
+        let refs = page
+            .link_annotations
+            .iter()
+            .map(|annotation| format!("{} 0 R", annotation.object_id))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("/Annots [ {refs} ] ")
+    };
+
     format!(
         concat!(
             "<< /Type /Page /Parent 2 0 R ",
             "/MediaBox [ 0 0 {:.4} {:.4} ] ",
             "/Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R >> {} >> ",
-            "/Contents {} 0 R >>"
+            "{}/Contents {} 0 R >>"
         ),
-        page.width_pt, page.height_pt, xobjects, page.content_id
+        page.width_pt, page.height_pt, xobjects, annots, page.content_id
     )
     .into_bytes()
 }
@@ -139,12 +154,30 @@ fn image_xobject(image: &PdfImage) -> Vec<u8> {
     object
 }
 
+fn link_annotation_object(annotation: &PdfLinkAnnotation) -> Vec<u8> {
+    format!(
+        concat!(
+            "<< /Type /Annot /Subtype /Link ",
+            "/Rect [ {:.4} {:.4} {:.4} {:.4} ] ",
+            "/Border [ 0 0 0 ] ",
+            "/A << /S /URI /URI ({}) >> >>"
+        ),
+        annotation.rect.x,
+        annotation.rect.y,
+        annotation.rect.x + annotation.rect.w,
+        annotation.rect.y + annotation.rect.h,
+        pdf_escape_string(&annotation.url)
+    )
+    .into_bytes()
+}
+
 struct PdfPageBuild {
     page_id: usize,
     content_id: usize,
     width_pt: f32,
     height_pt: f32,
     images: Vec<PdfImage>,
+    link_annotations: Vec<PdfLinkAnnotation>,
     content: Vec<u8>,
 }
 
@@ -157,6 +190,7 @@ impl PdfPageBuild {
         let height_pt = px_to_pt(page_size.y);
         let mut content = Vec::new();
         let mut images = Vec::new();
+        let mut link_annotations = Vec::new();
 
         push_rect_fill(&mut content, 0.0, 0.0, width_pt, height_pt, Color32::WHITE);
 
@@ -169,7 +203,9 @@ impl PdfPageBuild {
             match &render_box.kind {
                 RenderBoxKind::Text(block) => {
                     push_text_box(
+                        allocator,
                         &mut content,
+                        &mut link_annotations,
                         render_box,
                         &block.runs,
                         block.alignment,
@@ -198,6 +234,7 @@ impl PdfPageBuild {
             width_pt,
             height_pt,
             images,
+            link_annotations,
             content,
         }
     }
@@ -209,6 +246,12 @@ struct PdfImage {
     width_px: usize,
     height_px: usize,
     rgb: Vec<u8>,
+}
+
+struct PdfLinkAnnotation {
+    object_id: usize,
+    rect: PdfRect,
+    url: String,
 }
 
 impl PdfImage {
@@ -248,7 +291,9 @@ fn push_image_box(content: &mut Vec<u8>, render_box: &RenderBox, image_name: &st
 }
 
 fn push_text_box(
+    allocator: &mut ObjectAllocator,
     content: &mut Vec<u8>,
+    link_annotations: &mut Vec<PdfLinkAnnotation>,
     render_box: &RenderBox,
     runs: &[TextRun],
     alignment: TextAlignment,
@@ -338,6 +383,18 @@ fn push_text_box(
                     underline_y,
                     segment.style.color,
                 );
+            }
+            if let Some(url) = &segment.style.hyperlink {
+                link_annotations.push(PdfLinkAnnotation {
+                    object_id: allocator.alloc(),
+                    rect: PdfRect {
+                        x,
+                        y: y - font_size * 0.25,
+                        w: segment_width,
+                        h: font_size * 1.2,
+                    },
+                    url: url.clone(),
+                });
             }
             x += px_to_pt(segment.width_px());
         }
@@ -628,12 +685,21 @@ fn font_name(bold: bool, italic: bool) -> &'static str {
 }
 
 fn pdf_escape_text(text: &str) -> String {
+    pdf_escape_string_with_filter(text, false)
+}
+
+fn pdf_escape_string(text: &str) -> String {
+    pdf_escape_string_with_filter(text, true)
+}
+
+fn pdf_escape_string_with_filter(text: &str, keep_control_as_space: bool) -> String {
     let mut escaped = String::new();
     for ch in text.chars() {
         match ch {
             '(' => escaped.push_str("\\("),
             ')' => escaped.push_str("\\)"),
             '\\' => escaped.push_str("\\\\"),
+            '\r' | '\n' if keep_control_as_space => escaped.push(' '),
             '\r' | '\n' => {}
             ch if ch.is_ascii() && !ch.is_control() => escaped.push(ch),
             _ => escaped.push('?'),
@@ -907,6 +973,37 @@ mod tests {
         let pdf = String::from_utf8_lossy(&bytes);
 
         assert!(pdf.contains("60.7677 317.4803 Td (Centered) Tj"));
+    }
+
+    #[test]
+    fn hyperlink_text_writes_pdf_link_annotation() {
+        let mut slide = RichCanvas::new(vec2(1280.0, 720.0));
+        let mut style = TextStyle::body();
+        style.hyperlink = Some("https://example.com/path?q=1".to_owned());
+        let mut text = RenderBox::text(
+            1,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Example link", style)],
+        );
+        text.position = pos2(80.0, 80.0);
+        text.size = vec2(320.0, 90.0);
+        slide.push(text);
+
+        let bytes = export_pdf_bytes(&[slide]).expect("PDF export should succeed");
+        let pdf = String::from_utf8_lossy(&bytes);
+
+        assert!(pdf.contains("/Annots ["));
+        assert!(pdf.contains("/Subtype /Link"));
+        assert!(pdf.contains("/S /URI /URI (https://example.com/path?q=1)"));
+        assert!(pdf.contains("(Example link) Tj"));
+    }
+
+    #[test]
+    fn pdf_string_escape_handles_link_urls() {
+        assert_eq!(
+            pdf_escape_string(r"https://example.com/a(b)\c"),
+            r"https://example.com/a\(b\)\\c"
+        );
     }
 
     #[test]

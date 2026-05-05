@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::image_cache;
 use egui::{Color32, Pos2, Vec2, pos2, vec2};
 use flate2::read::DeflateDecoder;
 use quick_xml::{
@@ -1522,6 +1523,11 @@ impl<'a> SlideImporter<'a> {
         for (index, image) in master.background_images.iter().enumerate() {
             let entry_name = image.href.trim_start_matches("./");
             let bytes = self.package.entry_bytes(entry_name)?;
+            image_cache::store_image(
+                entry_name,
+                image_cache::media_type_for_path(entry_name),
+                &bytes,
+            );
             let image_block = ImageBlock::from_encoded_bytes(
                 PathBuf::from(entry_name),
                 &bytes,
@@ -1978,6 +1984,11 @@ impl FrameImport {
                 self.size.max(Vec2::splat(24.0)),
             );
             let bytes = package.entry_bytes(entry_name)?;
+            image_cache::store_image(
+                entry_name,
+                image_cache::media_type_for_path(entry_name),
+                &bytes,
+            );
             let image = ImageBlock::from_encoded_bytes(
                 PathBuf::from(entry_name),
                 &bytes,

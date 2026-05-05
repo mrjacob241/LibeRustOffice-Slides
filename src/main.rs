@@ -1,4 +1,5 @@
 use eframe::{App, Frame, NativeOptions, egui};
+mod image_cache;
 mod odp_loader;
 mod odp_saver;
 mod pdf_exporter;
@@ -301,6 +302,7 @@ struct LibeRustOfficeSlidesApp {
     highlight_rgb_picker: [u8; 3],
     recent_text_custom_colors: [Option<egui::Color32>; RECENT_COLOR_SLOT_COUNT],
     recent_highlight_custom_colors: [Option<egui::Color32>; RECENT_COLOR_SLOT_COUNT],
+    context_menu_link_url: Option<String>,
     fit_zoom_pending: bool,
     presentation_mode: bool,
     presentation_revealed_effects: usize,
@@ -375,6 +377,7 @@ impl LibeRustOfficeSlidesApp {
             highlight_rgb_picker: [255, 242, 0],
             recent_text_custom_colors: [None; RECENT_COLOR_SLOT_COUNT],
             recent_highlight_custom_colors: [None; RECENT_COLOR_SLOT_COUNT],
+            context_menu_link_url: None,
             fit_zoom_pending: true,
             presentation_mode: false,
             presentation_revealed_effects: 0,
@@ -432,6 +435,7 @@ impl LibeRustOfficeSlidesApp {
         self.caret_x_target = None;
         self.image_resize_drag = None;
         self.text_box_drag = None;
+        self.context_menu_link_url = None;
         self.fit_zoom_pending = true;
         self.presentation_mode = false;
         self.presentation_revealed_effects = 0;
@@ -520,6 +524,7 @@ impl LibeRustOfficeSlidesApp {
         self.caret_x_target = None;
         self.image_resize_drag = None;
         self.text_box_drag = None;
+        self.context_menu_link_url = None;
         self.fit_zoom_pending = true;
         if self.presentation_mode {
             self.reset_presentation_effects();
@@ -635,14 +640,6 @@ impl LibeRustOfficeSlidesApp {
                 }
                 _ => {}
             }
-        }
-
-        let advance_from_click = ctx.input(|input| {
-            input.pointer.button_pressed(egui::PointerButton::Primary)
-                || input.pointer.button_pressed(egui::PointerButton::Secondary)
-        });
-        if advance_from_click {
-            self.presentation_advance(ctx);
         }
     }
 
@@ -791,11 +788,45 @@ impl LibeRustOfficeSlidesApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
-                let rect = ui.max_rect();
-                let painter = ui.painter_at(rect);
+                let (response, painter) =
+                    ui.allocate_painter(ui.available_size(), egui::Sense::click());
+                let rect = response.rect;
 
-                self.presentation_canvas(ctx)
-                    .paint_page_preview(&painter, rect);
+                let mut presentation_canvas = self.presentation_canvas(ctx);
+                presentation_canvas.paint_page_preview(&painter, rect);
+
+                let hovered_hyperlink = response.hover_pos().and_then(|pointer| {
+                    presentation_canvas.page_preview_hyperlink_at(&painter, rect, pointer)
+                });
+                if let Some(link) = &hovered_hyperlink {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    response.clone().on_hover_ui_at_pointer(|ui| {
+                        ui.strong("Link");
+                        ui.label(&link.url);
+                    });
+                }
+
+                if response.clicked_by(egui::PointerButton::Primary)
+                    || response.clicked_by(egui::PointerButton::Secondary)
+                {
+                    if let Some(link) = hovered_hyperlink {
+                        if is_supported_external_url(&link.url) {
+                            match open_link_with_fallbacks(&link.url) {
+                                Ok(method) => {
+                                    self.status =
+                                        format!("Opened link with {method}: {}", link.url);
+                                }
+                                Err(error) => {
+                                    self.status = format!("Open link failed: {error}");
+                                }
+                            }
+                        } else {
+                            self.status = format!("Open link failed: unsupported URL {}", link.url);
+                        }
+                    } else {
+                        self.presentation_advance(ctx);
+                    }
+                }
 
                 let label = format!("{} / {}", self.active_slide + 1, self.slides.len());
                 painter.text(
@@ -1163,11 +1194,16 @@ impl LibeRustOfficeSlidesApp {
         let fit_zoom = (usable_size.x / canvas_size.x)
             .min(usable_size.y / canvas_size.y)
             .clamp(0.4, 3.0);
-        self.canvas.zoom = fit_zoom;
-        if let Some(slide) = self.slides.get_mut(self.active_slide) {
-            slide.zoom = fit_zoom;
-        }
+        self.set_zoom(fit_zoom);
         self.fit_zoom_pending = false;
+    }
+
+    fn set_zoom(&mut self, zoom: f32) {
+        let zoom = zoom.clamp(0.4, 3.0);
+        self.canvas.zoom = zoom;
+        if let Some(slide) = self.slides.get_mut(self.active_slide) {
+            slide.zoom = zoom;
+        }
     }
 
     fn draw_file_menu(&mut self, ui: &mut egui::Ui) {
@@ -1260,7 +1296,15 @@ impl LibeRustOfficeSlidesApp {
             ui.separator();
             self.draw_alignment_buttons(ui);
             ui.separator();
+            if ui.button("-").on_hover_text("Zoom out").clicked() {
+                self.set_zoom(self.canvas.zoom / 1.1);
+                self.fit_zoom_pending = false;
+            }
             ui.label(format!("Zoom: {:.0}%", self.canvas.zoom * 100.0));
+            if ui.button("+").on_hover_text("Zoom in").clicked() {
+                self.set_zoom(self.canvas.zoom * 1.1);
+                self.fit_zoom_pending = false;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(&self.status);
             });
@@ -1917,7 +1961,10 @@ impl LibeRustOfficeSlidesApp {
                     .and_then(|image| image.reload_from_path(path.trim()).err())
                 {
                     Some(error) => reload_error = Some(error.to_string()),
-                    None => image_changed = true,
+                    None => {
+                        image_cache::store_path(path.trim());
+                        image_changed = true;
+                    }
                 }
             }
         });
@@ -2884,27 +2931,32 @@ impl App for LibeRustOfficeSlidesApp {
                         ui.label(&link.url);
                     });
             }
+            if canvas_response.response.secondary_clicked() {
+                self.context_menu_link_url = hovered_hyperlink.map(|link| link.url);
+            }
             canvas_response.response.context_menu(|ui| {
-                if let Some(link) = &hovered_hyperlink {
+                if let Some(link_url) = self.context_menu_link_url.clone() {
                     if ui.button("Open Link").clicked() {
-                        if is_supported_external_url(&link.url) {
-                            match open_link_with_fallbacks(&link.url) {
+                        if is_supported_external_url(&link_url) {
+                            match open_link_with_fallbacks(&link_url) {
                                 Ok(method) => {
                                     self.status =
-                                        format!("Opened link with {method}: {}", link.url);
+                                        format!("Opened link with {method}: {}", link_url);
                                 }
                                 Err(error) => {
                                     self.status = format!("Open link failed: {error}");
                                 }
                             }
                         } else {
-                            self.status = format!("Open link failed: unsupported URL {}", link.url);
+                            self.status = format!("Open link failed: unsupported URL {}", link_url);
                         }
+                        self.context_menu_link_url = None;
                         ui.close();
                     }
                     if ui.button("Copy Link").clicked() {
-                        ctx.copy_text(link.url.clone());
-                        self.status = format!("Copied link {}", link.url);
+                        ctx.copy_text(link_url.clone());
+                        self.status = format!("Copied link {}", link_url);
+                        self.context_menu_link_url = None;
                         ui.close();
                     }
                 } else {
@@ -2912,6 +2964,9 @@ impl App for LibeRustOfficeSlidesApp {
                     ui.add_enabled(false, egui::Button::new("Copy Link"));
                 }
             });
+            if !canvas_response.response.context_menu_opened() {
+                self.context_menu_link_url = None;
+            }
             if canvas_response.drag_started {
                 if let (Some(box_id), Some(handle), Some(pointer)) = (
                     self.selected_box,

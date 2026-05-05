@@ -1,13 +1,16 @@
 use std::{
+    collections::HashMap,
     fmt, fs,
     io::{self, Write},
     path::Path,
 };
 
+use crate::image_cache;
 use egui::{Color32, Vec2};
 use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
 use rich_canvas::{
-    BoxStrokeKind, BoxStyle, RenderBox, RenderBoxKind, RichCanvas, TextAlignment, TextRun,
+    AnimationKind, AnimationSpec, BoxStrokeKind, BoxStyle, EmphasisEffect, EntranceEffect,
+    ExitEffect, FlyInDirection, RenderBox, RenderBoxKind, RichCanvas, TextAlignment, TextRun,
     TextStyle, TextVerticalAlignment,
 };
 
@@ -106,8 +109,9 @@ impl OdpPackage {
         );
         for image in &self.image_entries {
             xml.push_str(&format!(
-                r#"  <manifest:file-entry manifest:media-type="image/png" manifest:full-path="{}"/>
+                r#"  <manifest:file-entry manifest:media-type="{}" manifest:full-path="{}"/>
 "#,
+                xml_escape(&image.media_type),
                 xml_escape(&image.path)
             ));
         }
@@ -157,6 +161,7 @@ struct ContentBuilder {
     text_styles: Vec<SavedTextStyle>,
     graphic_styles: Vec<SavedGraphicStyle>,
     image_entries: Vec<SavedImageEntry>,
+    image_entry_by_cache_key: HashMap<String, String>,
 }
 
 impl ContentBuilder {
@@ -165,6 +170,7 @@ impl ContentBuilder {
             text_styles: Vec::new(),
             graphic_styles: Vec::new(),
             image_entries: Vec::new(),
+            image_entry_by_cache_key: HashMap::new(),
         }
     }
 
@@ -182,6 +188,7 @@ impl ContentBuilder {
             for render_box in boxes {
                 self.push_render_box(&mut pages, render_box)?;
             }
+            self.push_slide_animations(&mut pages, slide);
 
             pages.push_str("      </draw:page>\n");
         }
@@ -194,6 +201,8 @@ impl ContentBuilder {
   xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
   xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
   xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"
+  xmlns:anim="urn:oasis:names:tc:opendocument:xmlns:animation:1.0"
+  xmlns:smil="urn:oasis:names:tc:opendocument:xmlns:smil-compatible:1.0"
   xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
   xmlns:xlink="http://www.w3.org/1999/xlink"
   xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
@@ -225,9 +234,11 @@ impl ContentBuilder {
                     self.graphic_style_name(&render_box.style, block.vertical_alignment);
                 let frame_size = render_box.authored_size.unwrap_or(render_box.size);
                 xml.push_str(&format!(
-                    r#"        <draw:frame draw:style-name="{graphic_style_name}" svg:x="{}" svg:y="{}" svg:width="{}" svg:height="{}">
+                    r#"        <draw:frame xml:id="{}" draw:id="{}" draw:style-name="{graphic_style_name}" svg:x="{}" svg:y="{}" svg:width="{}" svg:height="{}">
           <draw:text-box>
             <text:p text:style-name="{}">"#,
+                    frame_id(render_box),
+                    frame_id(render_box),
                     length_cm(render_box.position.x),
                     length_cm(render_box.position.y),
                     length_cm(frame_size.x * render_box.scale.x),
@@ -245,17 +256,14 @@ impl ContentBuilder {
                 );
             }
             RenderBoxKind::Image(block) => {
-                let entry_path = format!("Pictures/image-{}.png", self.image_entries.len() + 1);
-                let bytes = encode_color_image_png(block)?;
-                self.image_entries.push(SavedImageEntry {
-                    path: entry_path.clone(),
-                    bytes,
-                });
+                let entry_path = self.image_entry_path(block)?;
                 xml.push_str(&format!(
-                    r#"        <draw:frame svg:x="{}" svg:y="{}" svg:width="{}" svg:height="{}">
+                    r#"        <draw:frame xml:id="{}" draw:id="{}" svg:x="{}" svg:y="{}" svg:width="{}" svg:height="{}">
           <draw:image xlink:href="{}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>
         </draw:frame>
 "#,
+                    frame_id(render_box),
+                    frame_id(render_box),
                     length_cm(render_box.position.x),
                     length_cm(render_box.position.y),
                     length_cm(render_box.size.x * render_box.scale.x),
@@ -267,6 +275,78 @@ impl ContentBuilder {
         }
 
         Ok(())
+    }
+
+    fn image_entry_path(
+        &mut self,
+        block: &rich_canvas::ImageBlock,
+    ) -> Result<String, OdpSaveError> {
+        let cache_key = block.path.to_string_lossy().to_string();
+        if let Some(path) = self.image_entry_by_cache_key.get(&cache_key) {
+            return Ok(path.clone());
+        }
+
+        let (media_type, bytes) = if let Some(cached) = image_cache::load_latest(&cache_key) {
+            (cached.media_type, cached.bytes)
+        } else {
+            ("image/png".to_owned(), encode_color_image_png(block)?)
+        };
+
+        if let Some(existing) = self
+            .image_entries
+            .iter()
+            .find(|entry| entry.media_type == media_type && entry.bytes == bytes)
+        {
+            self.image_entry_by_cache_key
+                .insert(cache_key, existing.path.clone());
+            return Ok(existing.path.clone());
+        }
+
+        let extension = image_cache::extension_for_media_type(&media_type);
+        let entry_path = format!(
+            "Pictures/image-{}.{}",
+            self.image_entries.len() + 1,
+            extension
+        );
+        self.image_entries.push(SavedImageEntry {
+            path: entry_path.clone(),
+            media_type,
+            bytes,
+        });
+        self.image_entry_by_cache_key
+            .insert(cache_key, entry_path.clone());
+        Ok(entry_path)
+    }
+
+    fn push_slide_animations(&self, xml: &mut String, slide: &RichCanvas) {
+        let mut boxes = slide.boxes.iter().collect::<Vec<_>>();
+        boxes.sort_by_key(|render_box| render_box.z_index);
+        let mut entries = String::new();
+        for render_box in boxes {
+            if !render_box.visible {
+                continue;
+            }
+            let Some(animation) = &render_box.animation else {
+                continue;
+            };
+            if let Some(animation_xml) = animation_xml(render_box, animation) {
+                entries.push_str(&animation_xml);
+            }
+        }
+
+        if !entries.is_empty() {
+            xml.push_str(
+                r#"        <anim:par presentation:node-type="timing-root">
+          <anim:seq presentation:node-type="main-sequence">
+"#,
+            );
+            xml.push_str(&entries);
+            xml.push_str(
+                r#"          </anim:seq>
+        </anim:par>
+"#,
+            );
+        }
     }
 
     fn push_text_run(&mut self, xml: &mut String, run: &TextRun) {
@@ -371,6 +451,311 @@ impl ContentBuilder {
     }
 }
 
+fn animation_xml(render_box: &RenderBox, animation: &AnimationSpec) -> Option<String> {
+    let target = frame_id(render_box);
+    match animation.kind {
+        AnimationKind::PreviewOscillation => None,
+        AnimationKind::Entrance {
+            effect,
+            direction,
+            duration_seconds,
+        } => Some(animation_effect_xml(
+            "entrance",
+            entrance_preset_id(effect),
+            entrance_preset_sub_type(effect, direction),
+            animation_child_xml(
+                "entrance",
+                effect == EntranceEffect::Appear,
+                entrance_motion_direction(effect, direction),
+                duration_seconds,
+                &target,
+            ),
+        )),
+        AnimationKind::Emphasis {
+            effect,
+            duration_seconds,
+        } => Some(animation_effect_xml(
+            "emphasis",
+            emphasis_preset_id(effect),
+            None,
+            animation_child_xml("emphasis", false, None, duration_seconds, &target),
+        )),
+        AnimationKind::Exit {
+            effect,
+            direction,
+            duration_seconds,
+        } => Some(animation_effect_xml(
+            "exit",
+            exit_preset_id(effect),
+            exit_preset_sub_type(effect, direction),
+            animation_child_xml(
+                "exit",
+                effect == ExitEffect::Disappear,
+                direction,
+                duration_seconds,
+                &target,
+            ),
+        )),
+    }
+}
+
+fn animation_effect_xml(
+    preset_class: &str,
+    preset_id: &str,
+    preset_sub_type: Option<&str>,
+    child_xml: String,
+) -> String {
+    let preset_sub_type_attr = preset_sub_type
+        .map(|sub_type| {
+            format!(
+                r#" presentation:preset-sub-type="{}""#,
+                xml_escape(sub_type)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"            <anim:par smil:begin="next">
+              <anim:par smil:begin="0s">
+                <anim:par smil:begin="0s" smil:fill="hold" presentation:node-type="on-click" presentation:preset-class="{preset_class}" presentation:preset-id="{preset_id}"{preset_sub_type_attr}>
+                  {child_xml}
+                </anim:par>
+              </anim:par>
+            </anim:par>
+"#
+    )
+}
+
+fn animation_child_xml(
+    preset_class: &str,
+    use_visibility_set: bool,
+    direction: Option<FlyInDirection>,
+    duration_seconds: f32,
+    target: &str,
+) -> String {
+    let duration = duration_s(duration_seconds);
+    let escaped_target = xml_escape(target);
+    if use_visibility_set {
+        let visibility = if preset_class == "exit" {
+            "hidden"
+        } else {
+            "visible"
+        };
+        return format!(
+            r#"<anim:set smil:dur="{duration}" smil:fill="hold" smil:targetElement="{}" smil:attributeName="visibility" smil:to="{visibility}"/>"#,
+            escaped_target
+        );
+    }
+
+    if preset_class == "entrance" {
+        if let Some(direction) = direction {
+            let (x_values, y_values) = fly_in_xy_values(direction);
+            return format!(
+                concat!(
+                    r#"<anim:set smil:begin="0s" smil:dur="0.001s" smil:fill="hold" smil:targetElement="{}" smil:attributeName="visibility" smil:to="visible"/>"#,
+                    "\n                  ",
+                    r#"<anim:animate smil:dur="{}" smil:fill="hold" smil:targetElement="{}" smil:attributeName="x" smil:values="{}" smil:keyTimes="0;1"/>"#,
+                    "\n                  ",
+                    r#"<anim:animate smil:dur="{}" smil:fill="hold" smil:targetElement="{}" smil:attributeName="y" smil:values="{}" smil:keyTimes="0;1"/>"#
+                ),
+                escaped_target,
+                duration,
+                escaped_target,
+                x_values,
+                duration,
+                escaped_target,
+                y_values
+            );
+        }
+    }
+
+    let (attribute, values) = animation_motion_values(direction);
+    format!(
+        r#"<anim:animate smil:dur="{duration}" smil:fill="hold" smil:targetElement="{}" smil:attributeName="{attribute}" smil:values="{values}" smil:keyTimes="0;1"/>"#,
+        escaped_target
+    )
+}
+
+fn animation_motion_values(direction: Option<FlyInDirection>) -> (&'static str, &'static str) {
+    match direction {
+        Some(FlyInDirection::FromRight) => ("x", "1+width/2;x"),
+        Some(FlyInDirection::FromLeft) => ("x", "-width/2;x"),
+        Some(FlyInDirection::FromBottom) => ("y", "1+height/2;y"),
+        Some(FlyInDirection::FromTop) => ("y", "-height/2;y"),
+        None => ("opacity", "0;1"),
+    }
+}
+
+fn fly_in_xy_values(direction: FlyInDirection) -> (&'static str, &'static str) {
+    match direction {
+        FlyInDirection::FromLeft => ("-width/2;x", "y;y"),
+        FlyInDirection::FromRight => ("1+width/2;x", "y;y"),
+        FlyInDirection::FromTop => ("x;x", "-height/2;y"),
+        FlyInDirection::FromBottom => ("x;x", "1+height/2;y"),
+    }
+}
+
+fn frame_id(render_box: &RenderBox) -> String {
+    format!("box{}", render_box.id)
+}
+
+fn duration_s(duration_seconds: f32) -> String {
+    format!("{:.3}s", duration_seconds.max(0.001))
+}
+
+fn direction_preset_sub_type(direction: FlyInDirection) -> &'static str {
+    match direction {
+        FlyInDirection::FromLeft => "from-left",
+        FlyInDirection::FromRight => "from-right",
+        FlyInDirection::FromTop => "from-top",
+        FlyInDirection::FromBottom => "from-bottom",
+    }
+}
+
+fn entrance_preset_sub_type(
+    effect: EntranceEffect,
+    direction: Option<FlyInDirection>,
+) -> Option<&'static str> {
+    match effect {
+        EntranceEffect::VenetianBlinds => Some("horizontal"),
+        EntranceEffect::Box => Some("out"),
+        EntranceEffect::Checkerboard => Some("across"),
+        EntranceEffect::Circle => Some("out"),
+        EntranceEffect::Oval => Some("out"),
+        EntranceEffect::FlyIn | EntranceEffect::FlyInSlow => Some(direction_preset_sub_type(
+            direction.unwrap_or(FlyInDirection::FromBottom),
+        )),
+        EntranceEffect::Diamond => Some("out"),
+        EntranceEffect::Plus => Some("out"),
+        EntranceEffect::RandomBars => Some("horizontal"),
+        EntranceEffect::Split => Some("horizontal-out"),
+        EntranceEffect::Wipe => Some(direction_preset_sub_type(
+            direction.unwrap_or(FlyInDirection::FromLeft),
+        )),
+        EntranceEffect::Wheel => Some("1"),
+        EntranceEffect::Zoom => Some("in"),
+        _ => None,
+    }
+}
+
+fn entrance_motion_direction(
+    effect: EntranceEffect,
+    direction: Option<FlyInDirection>,
+) -> Option<FlyInDirection> {
+    match effect {
+        EntranceEffect::FlyIn | EntranceEffect::FlyInSlow => {
+            Some(direction.unwrap_or(FlyInDirection::FromBottom))
+        }
+        _ => None,
+    }
+}
+
+fn exit_preset_sub_type(
+    effect: ExitEffect,
+    direction: Option<FlyInDirection>,
+) -> Option<&'static str> {
+    if let Some(direction) = direction {
+        return Some(direction_preset_sub_type(direction));
+    }
+
+    match effect {
+        ExitEffect::Box => Some("in"),
+        ExitEffect::Diamond => Some("diamond"),
+        _ => None,
+    }
+}
+
+fn entrance_preset_id(effect: EntranceEffect) -> &'static str {
+    match effect {
+        EntranceEffect::Appear => "ooo-entrance-appear",
+        EntranceEffect::VenetianBlinds => "ooo-entrance-venetian-blinds",
+        EntranceEffect::Box => "ooo-entrance-box",
+        EntranceEffect::Checkerboard => "ooo-entrance-checkerboard",
+        EntranceEffect::Circle => "ooo-entrance-circle",
+        EntranceEffect::Oval => "ooo-entrance-oval",
+        EntranceEffect::FlyIn => "ooo-entrance-fly-in",
+        EntranceEffect::FlyInSlow => "ooo-entrance-fly-in-slow",
+        EntranceEffect::DissolveIn => "ooo-entrance-dissolve-in",
+        EntranceEffect::FadeIn => "ooo-entrance-fade-in",
+        EntranceEffect::FadeInAndZoom => "ooo-entrance-fade-in-and-zoom",
+        EntranceEffect::Zoom => "ooo-entrance-zoom",
+        EntranceEffect::Expand => "ooo-entrance-expand",
+        EntranceEffect::SpinIn => "ooo-entrance-spin-in",
+        EntranceEffect::Bounce => "ooo-entrance-bounce",
+        EntranceEffect::SpiralIn => "ooo-entrance-spiral-in",
+        EntranceEffect::Boomerang => "ooo-entrance-boomerang",
+        EntranceEffect::Sling => "ooo-entrance-sling",
+        EntranceEffect::Glide => "ooo-entrance-glide",
+        EntranceEffect::Float => "ooo-entrance-float",
+        EntranceEffect::Magnify => "ooo-entrance-magnify",
+        EntranceEffect::Wipe => "ooo-entrance-wipe",
+        EntranceEffect::Wheel => "ooo-entrance-wheel",
+        EntranceEffect::RandomBars => "ooo-entrance-random-bars",
+        EntranceEffect::Split => "ooo-entrance-split",
+        EntranceEffect::Plus => "ooo-entrance-plus",
+        EntranceEffect::Diamond => "ooo-entrance-diamond",
+    }
+}
+
+fn emphasis_preset_id(effect: EmphasisEffect) -> &'static str {
+    match effect {
+        EmphasisEffect::Spin => "ooo-emphasis-spin",
+        EmphasisEffect::GrowShrink => "ooo-emphasis-grow-shrink",
+        EmphasisEffect::Pulse => "ooo-emphasis-pulse",
+        EmphasisEffect::Teeter => "ooo-emphasis-teeter",
+        EmphasisEffect::Transparency => "ooo-emphasis-transparency",
+        EmphasisEffect::FillColor => "ooo-emphasis-fill-color",
+        EmphasisEffect::LineColor => "ooo-emphasis-line-color",
+        EmphasisEffect::FontColor => "ooo-emphasis-font-color",
+        EmphasisEffect::BoldFlash => "ooo-emphasis-bold-flash",
+        EmphasisEffect::Blink => "ooo-emphasis-blink",
+        EmphasisEffect::ColorPulse => "ooo-emphasis-color-pulse",
+        EmphasisEffect::GrowWithColor => "ooo-emphasis-grow-with-color",
+        EmphasisEffect::Lighten => "ooo-emphasis-lighten",
+        EmphasisEffect::Desaturate => "ooo-emphasis-desaturate",
+        EmphasisEffect::Wave => "ooo-emphasis-wave",
+        EmphasisEffect::Flicker => "ooo-emphasis-flicker",
+        EmphasisEffect::VerticalHighlight => "ooo-emphasis-vertical-highlight",
+        EmphasisEffect::HorizontalHighlight => "ooo-emphasis-horizontal-highlight",
+    }
+}
+
+fn exit_preset_id(effect: ExitEffect) -> &'static str {
+    match effect {
+        ExitEffect::Disappear => "ooo-exit-disappear",
+        ExitEffect::FadeOut => "ooo-exit-fade-out",
+        ExitEffect::FlyOut => "ooo-exit-fly-out",
+        ExitEffect::FlyOutSlow => "ooo-exit-fly-out-slow",
+        ExitEffect::WipeOut => "ooo-exit-wipe-out",
+        ExitEffect::Split => "ooo-exit-split",
+        ExitEffect::Box => "ooo-exit-box",
+        ExitEffect::Circle => "ooo-exit-circle",
+        ExitEffect::Diamond => "ooo-exit-diamond",
+        ExitEffect::DissolveOut => "ooo-exit-dissolve-out",
+        ExitEffect::RandomBars => "ooo-exit-random-bars",
+        ExitEffect::Checkerboard => "ooo-exit-checkerboard",
+        ExitEffect::VenetianBlinds => "ooo-exit-venetian-blinds",
+        ExitEffect::Wheel => "ooo-exit-wheel",
+        ExitEffect::ClockWipe => "ooo-exit-clock-wipe",
+        ExitEffect::PeekOut => "ooo-exit-peek-out",
+        ExitEffect::Zoom => "ooo-exit-zoom",
+        ExitEffect::FadeOutAndZoom => "ooo-exit-fade-out-and-zoom",
+        ExitEffect::Collapse => "ooo-exit-collapse",
+        ExitEffect::Compress => "ooo-exit-compress",
+        ExitEffect::Stretchy => "ooo-exit-stretchy",
+        ExitEffect::SpinOut => "ooo-exit-spin-out",
+        ExitEffect::Swivel => "ooo-exit-swivel",
+        ExitEffect::Sling => "ooo-exit-sling",
+        ExitEffect::SpiralOut => "ooo-exit-spiral-out",
+        ExitEffect::Boomerang => "ooo-exit-boomerang",
+        ExitEffect::Bounce => "ooo-exit-bounce",
+        ExitEffect::Float => "ooo-exit-float",
+        ExitEffect::Glide => "ooo-exit-glide",
+        ExitEffect::Fold => "ooo-exit-fold",
+        ExitEffect::Thread => "ooo-exit-thread",
+        ExitEffect::Random => "ooo-exit-random",
+    }
+}
+
 #[derive(Clone)]
 struct SavedTextStyle {
     name: String,
@@ -466,6 +851,7 @@ impl SavedGraphicStyle {
 
 struct SavedImageEntry {
     path: String,
+    media_type: String,
     bytes: Vec<u8>,
 }
 
@@ -727,6 +1113,266 @@ mod tests {
     }
 
     #[test]
+    fn text_hyperlinks_are_saved_as_text_a_and_reload() {
+        let mut slide = RichCanvas::new(vec2(1280.0, 720.0));
+        let mut style = TextStyle::body();
+        style.hyperlink = Some("https://example.com".to_owned());
+        let mut text = RenderBox::text(
+            1,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Example", style)],
+        );
+        text.position = pos2(80.0, 90.0);
+        text.size = vec2(420.0, 120.0);
+        slide.push(text);
+
+        let package = OdpPackage::from_slides(&[slide.clone()]).expect("package can be built");
+        assert!(package.content_xml.contains(
+            r#"<text:a xlink:type="simple" xlink:href="https://example.com"><text:span"#
+        ));
+
+        let path = std::env::temp_dir().join("liberustoffice_saved_link.odp");
+        save_odp(&path, &[slide]).expect("save succeeds");
+        let loaded = odp_loader::load_odp(&path).expect("saved ODP loads");
+        let RenderBoxKind::Text(block) = &loaded.slides[0].boxes[0].kind else {
+            panic!("expected text box");
+        };
+        assert_eq!(
+            block.runs[0].style.hyperlink.as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn animations_are_saved_and_reload() {
+        let mut slide = RichCanvas::new(vec2(1280.0, 720.0));
+        let mut entrance = RenderBox::text(
+            1,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Entrance", TextStyle::body())],
+        );
+        entrance.animation = Some(AnimationSpec::entrance(
+            EntranceEffect::FlyIn,
+            Some(FlyInDirection::FromLeft),
+            0.75,
+        ));
+        let mut emphasis = RenderBox::text(
+            2,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Emphasis", TextStyle::body())],
+        );
+        emphasis.position = pos2(80.0, 160.0);
+        emphasis.animation = Some(AnimationSpec::emphasis(EmphasisEffect::Pulse, 0.5));
+        let mut exit = RenderBox::text(
+            3,
+            LayoutRole::Absolute,
+            vec![TextRun::new("Exit", TextStyle::body())],
+        );
+        exit.position = pos2(80.0, 240.0);
+        exit.animation = Some(AnimationSpec::exit(
+            ExitEffect::FadeOut,
+            Some(FlyInDirection::FromTop),
+            0.6,
+        ));
+        slide.push(entrance);
+        slide.push(emphasis);
+        slide.push(exit);
+
+        let package = OdpPackage::from_slides(&[slide.clone()]).expect("package can be built");
+        assert!(package.content_xml.contains(r#"xml:id="box1""#));
+        assert!(package.content_xml.contains(r#"draw:id="box1""#));
+        assert!(
+            package
+                .content_xml
+                .contains(r#"presentation:node-type="timing-root""#)
+        );
+        assert!(
+            package
+                .content_xml
+                .contains(r#"presentation:node-type="main-sequence""#)
+        );
+        assert!(package.content_xml.contains(r#"smil:attributeName="x""#));
+        assert!(package.content_xml.contains(r#"smil:values="-width/2;x""#));
+        assert!(package.content_xml.contains(r#"smil:values="y;y""#));
+        assert!(
+            package
+                .content_xml
+                .contains(r#"smil:attributeName="visibility" smil:to="visible""#)
+        );
+        assert!(
+            package
+                .content_xml
+                .contains(r#"presentation:preset-id="ooo-entrance-fly-in""#)
+        );
+        assert!(
+            package
+                .content_xml
+                .contains(r#"presentation:preset-id="ooo-emphasis-pulse""#)
+        );
+        assert!(
+            package
+                .content_xml
+                .contains(r#"presentation:preset-id="ooo-exit-fade-out""#)
+        );
+        assert!(
+            package
+                .content_xml
+                .contains(r#"presentation:preset-sub-type="from-left""#)
+        );
+        assert!(
+            package
+                .content_xml
+                .contains(r#"presentation:preset-sub-type="from-top""#)
+        );
+
+        let path = std::env::temp_dir().join("liberustoffice_saved_animations.odp");
+        save_odp(&path, &[slide]).expect("save succeeds");
+        let loaded = odp_loader::load_odp(&path).expect("saved ODP loads");
+        let animations = loaded.slides[0]
+            .boxes
+            .iter()
+            .map(|render_box| {
+                render_box
+                    .animation
+                    .as_ref()
+                    .map(|animation| &animation.kind)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            animations[0],
+            Some(AnimationKind::Entrance {
+                effect: EntranceEffect::FlyIn,
+                direction: Some(FlyInDirection::FromLeft),
+                duration_seconds,
+            }) if (duration_seconds - 0.75).abs() < 0.001
+        ));
+        assert!(matches!(
+            animations[1],
+            Some(AnimationKind::Emphasis {
+                effect: EmphasisEffect::Pulse,
+                duration_seconds,
+            }) if (duration_seconds - 0.5).abs() < 0.001
+        ));
+        assert!(matches!(
+            animations[2],
+            Some(AnimationKind::Exit {
+                effect: ExitEffect::FadeOut,
+                direction: Some(FlyInDirection::FromTop),
+                duration_seconds,
+            }) if (duration_seconds - 0.6).abs() < 0.001
+        ));
+    }
+
+    #[test]
+    fn entrance_preset_sub_types_match_libreoffice_second_fields() {
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::VenetianBlinds, None),
+            Some("horizontal")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Box, None),
+            Some("out")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Checkerboard, None),
+            Some("across")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Circle, None),
+            Some("out")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Oval, None),
+            Some("out")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::FlyIn, None),
+            Some("from-bottom")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::FlyInSlow, Some(FlyInDirection::FromTop)),
+            Some("from-top")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Diamond, None),
+            Some("out")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Plus, None),
+            Some("out")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::RandomBars, None),
+            Some("horizontal")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Split, None),
+            Some("horizontal-out")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Wipe, None),
+            Some("from-left")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Wheel, None),
+            Some("1")
+        );
+        assert_eq!(
+            entrance_preset_sub_type(EntranceEffect::Zoom, None),
+            Some("in")
+        );
+        assert_eq!(entrance_preset_sub_type(EntranceEffect::Appear, None), None);
+        assert_eq!(
+            entrance_motion_direction(EntranceEffect::FlyIn, None),
+            Some(FlyInDirection::FromBottom)
+        );
+        assert_eq!(
+            entrance_motion_direction(EntranceEffect::Box, Some(FlyInDirection::FromLeft)),
+            None
+        );
+    }
+
+    #[test]
+    fn cached_original_image_bytes_are_saved_and_deduplicated() {
+        let original_jpeg = b"original jpeg bytes";
+        crate::image_cache::store_image("Pictures/source.jpg", "image/jpeg", original_jpeg);
+
+        let mut slide = RichCanvas::new(vec2(1280.0, 720.0));
+        let mut image_a = RenderBox::image(
+            1,
+            LayoutRole::Absolute,
+            "Pictures/source.jpg",
+            vec2(320.0, 180.0),
+        );
+        image_a.position = pos2(80.0, 80.0);
+        let mut image_b = RenderBox::image(
+            2,
+            LayoutRole::Absolute,
+            "Pictures/source.jpg",
+            vec2(320.0, 180.0),
+        );
+        image_b.position = pos2(420.0, 80.0);
+        slide.push(image_a);
+        slide.push(image_b);
+
+        let package = OdpPackage::from_slides(&[slide]).expect("package can be built");
+
+        assert_eq!(package.image_entries.len(), 1);
+        assert_eq!(package.image_entries[0].media_type, "image/jpeg");
+        assert_eq!(package.image_entries[0].bytes, original_jpeg);
+        assert!(
+            package
+                .content_xml
+                .contains(r#"xlink:href="Pictures/image-1.jpg""#)
+        );
+        assert_eq!(
+            package.content_xml.matches("Pictures/image-1.jpg").count(),
+            2
+        );
+    }
+
+    #[test]
     fn crc32_matches_known_value() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
     }
@@ -747,6 +1393,7 @@ mod tests {
         bold: bool,
         italic: bool,
         underline: bool,
+        hyperlink: Option<String>,
     }
 
     fn text_scheme(slides: &[RichCanvas]) -> Vec<Vec<TextBoxScheme>> {
@@ -781,6 +1428,7 @@ mod tests {
             bold: run.style.bold,
             italic: run.style.italic,
             underline: run.style.underline,
+            hyperlink: run.style.hyperlink.clone(),
         }
     }
 
@@ -809,6 +1457,7 @@ mod tests {
                     assert_eq!(actual_run.bold, expected_run.bold);
                     assert_eq!(actual_run.italic, expected_run.italic);
                     assert_eq!(actual_run.underline, expected_run.underline);
+                    assert_eq!(actual_run.hyperlink, expected_run.hyperlink);
                 }
             }
         }

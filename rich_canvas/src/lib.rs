@@ -411,6 +411,45 @@ impl RichCanvas {
         }
     }
 
+    pub fn page_preview_hyperlink_at(
+        &self,
+        painter: &Painter,
+        target_rect: Rect,
+        pointer_pos: Pos2,
+    ) -> Option<CanvasHyperlink> {
+        if !target_rect.contains(pointer_pos) {
+            return None;
+        }
+
+        let scale = (target_rect.width() / self.page.size.x)
+            .min(target_rect.height() / self.page.size.y)
+            .max(0.001);
+        let page_size = self.page.size * scale;
+        let page_rect = Rect::from_center_size(target_rect.center(), page_size);
+        if !page_rect.contains(pointer_pos) {
+            return None;
+        }
+
+        let mut visible_boxes: Vec<&RenderBox> =
+            self.boxes.iter().filter(|item| item.visible).collect();
+        visible_boxes.sort_by_key(|item| item.z_index);
+
+        visible_boxes.into_iter().rev().find_map(|render_box| {
+            if !self.hit_test_render_box_at_scale(render_box, page_rect.min, scale, pointer_pos) {
+                return None;
+            }
+            let char_index =
+                render_box.caret_index_at(page_rect.min, scale, pointer_pos, painter)?;
+            render_box
+                .hyperlink_at(char_index)
+                .map(|url| CanvasHyperlink {
+                    box_id: render_box.id,
+                    char_index,
+                    url,
+                })
+        })
+    }
+
     fn show_canvas_ui(
         &mut self,
         ui: &mut Ui,
@@ -688,7 +727,17 @@ impl RichCanvas {
     }
 
     fn hit_test_render_box(&self, render_box: &RenderBox, origin: Pos2, pointer_pos: Pos2) -> bool {
-        let rect = render_box.rect(origin, self.zoom);
+        self.hit_test_render_box_at_scale(render_box, origin, self.zoom, pointer_pos)
+    }
+
+    fn hit_test_render_box_at_scale(
+        &self,
+        render_box: &RenderBox,
+        origin: Pos2,
+        scale: f32,
+        pointer_pos: Pos2,
+    ) -> bool {
+        let rect = render_box.rect(origin, scale);
         if render_box.is_image() && render_box.rotation.abs() > f32::EPSILON {
             rotated_rect_contains(rect, render_box.rotation, pointer_pos)
         } else {

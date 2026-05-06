@@ -7,7 +7,7 @@
 This project has been built from scratch in Rust and it is not related or endorsed in any case and in any way by more famous Open Source Office Suites.
 
 
-![App Screenshot](panel_figs/sample_image.png)
+![App Screenshot](panel_figs/sample_image_new.png)
 
 ## 🚧 Planned Features 🚧 
 

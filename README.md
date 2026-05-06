@@ -34,7 +34,6 @@ This project has been built from scratch in Rust and it is not related or endors
 - [x] Export to PDF  
 - [ ] Real-time collaboration  
 - [ ] Cloud sync integration  
-- [ ] Full compatibility with LibreOffice   
 - [x] Presenter mode  
 - [ ] Native printing (Linux)
 - [ ] Spell checking and grammar suggestions  

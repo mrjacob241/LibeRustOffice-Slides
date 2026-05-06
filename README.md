@@ -2,6 +2,10 @@
 
 **ForgiatuSuiteDocs** is a ODP (Open Document Presentation format) text editor, which has been vibe coded in the spare time with Codex. But not gonna lie, I wouldn't define it a "project" at this stage, because it barely exists...
 
+## ⚠️ DISCLAIMER!!! ⚠️
+
+This project has been built from scratch in Rust and it is not related or endorsed in any case and in any way by more famous Open Source Office Suites.
+
 
 ![App Screenshot](panel_figs/sample_image.png)
 

@@ -19,7 +19,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const APP_TITLE: &str = "LibeRustOffice Slides v0.01";
+const APP_TITLE: &str = "ForgiatuSuiteDocs Slides v0.01";
 const SIDE_PANEL_MIN_WIDTH: f32 = 180.0;
 const SIDE_PANEL_DEFAULT_WIDTH: f32 = 220.0;
 const SIDE_PANEL_MAX_WIDTH: f32 = 420.0;
